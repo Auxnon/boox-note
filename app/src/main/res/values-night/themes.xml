@@ -1,0 +1,18 @@
+<resources>
+    <style name="Theme.BooxNote" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#000000</item>
+        <item name="colorPrimaryVariant">#000000</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <!-- The app's canvas/toolbar are always white regardless of system dark mode (it's an
+             e-ink drawing surface), so keep the status bar matching rather than switching to a
+             dark bar that would then clash with the still-white toolbar underneath it. -->
+        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <style name="Theme.BooxNote.AboutDialog" parent="Theme.AppCompat.Dialog">
+        <item name="android:windowMinWidthMajor">0%</item>
+        <item name="android:windowMinWidthMinor">0%</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+    </style>
+</resources>
