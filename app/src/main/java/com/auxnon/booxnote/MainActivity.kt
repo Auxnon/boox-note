@@ -4,11 +4,11 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.ClipData
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.ImageDecoder
-import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
@@ -50,33 +50,35 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
-    private enum class EraserExitCause {
-        BRUSH_SELECTION,
-        COLOR_SELECTION,
-        OTHER,
-    }
+    /** One independently-configured pen: brush type, ink color and stroke width. */
+    private data class ToolPreset(
+        var style: HardwarePenStyle,
+        var color: Int,
+        var widthPx: Float,
+    )
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val PREFS_NAME = "boox_einkdraw_prefs"
+        private const val PREFS_NAME = "boox_note_prefs"
         private const val KEY_LAST_OPEN_URI = "last_open_uri"
         private const val UI_TOUCH_WATCHDOG_MS = 4000L
-        private const val BRUSH_ICON_SCALE = 1.5f
+        private const val TOOL_SLOT_COUNT = 3
     }
 
     private lateinit var penView: HardwarePenSurfaceView
     private lateinit var rootFrame: View
     private lateinit var toolbarRow: View
-    private lateinit var brushRow: LinearLayout
-    private lateinit var widthSeekBar: SeekBar
-    private lateinit var widthValueLabel: TextView
+    private lateinit var toolSlotButtons: List<ImageButton>
     private lateinit var zoomValueLabel: TextView
-    private lateinit var swatchBlack: View
-    private lateinit var swatchWhite: View
-    private lateinit var swatchBlue: View
-    private lateinit var colorPickerPanel: View
-    private lateinit var colorPickerView: CircularColorPickerView
-    private lateinit var colorHexValue: TextView
+    private lateinit var toolModalPanel: View
+    private lateinit var modalColorButton: ImageButton
+    private lateinit var modalSizeButton: TextView
+    private lateinit var modalColorSection: View
+    private lateinit var modalSizeSection: View
+    private lateinit var modalColorPickerView: CircularColorPickerView
+    private lateinit var modalColorHexValue: TextView
+    private lateinit var modalSizeSeekBar: SeekBar
+    private lateinit var modalSizeValueLabel: TextView
     private lateinit var layerPanel: View
     private lateinit var layerDragHandle: View
     private lateinit var layerRecycler: RecyclerView
@@ -87,6 +89,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonAddLayer: ImageButton
     private lateinit var buttonRemoveLayer: ImageButton
     private lateinit var layerAdapter: LayerListAdapter
+    private val brushGridButtons = LinkedHashMap<HardwarePenStyle, ImageButton>(HardwarePenStyle.entries.size)
 
     /**
      * Handheld e-ink panels (e.g. Boox Palma Pro 2, ~6.1") are physically small but often very
@@ -107,25 +110,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val brushButtons = LinkedHashMap<HardwarePenStyle, ImageButton>(HardwarePenStyle.entries.size)
-    private val brushWidths = HardwarePenStyle.entries.associateWith { it.defaultWidthPx }.toMutableMap()
-    private var selectedBrushStyle: HardwarePenStyle = HardwarePenStyle.PENCIL
-    private var selectedBrushBtn: ImageButton? = null
-    private var selectedColorSwatch: View? = null
+    /**
+     * Three independently-configured pens ("tool groups"), each remembering its own brush type,
+     * color and width. Defaults spread across a few common styles so the three slots aren't
+     * identical out of the box.
+     */
+    private val toolPresets = arrayOf(
+        ToolPreset(HardwarePenStyle.PENCIL, Color.BLACK, HardwarePenStyle.PENCIL.defaultWidthPx),
+        ToolPreset(HardwarePenStyle.FOUNTAIN, Color.BLACK, HardwarePenStyle.FOUNTAIN.defaultWidthPx),
+        ToolPreset(HardwarePenStyle.MARKER, Color.BLACK, HardwarePenStyle.MARKER.defaultWidthPx),
+    )
+    private var selectedToolIndex: Int = 0
     private var pickerInFlight: Boolean = false
     private var activityPaused: Boolean = false
     private var uiTouchDepth: Int = 0
     private var aboutDialogVisible: Boolean = false
     private var layerDragDx: Float = 0f
     private var layerDragDy: Float = 0f
-    private var currentInkColor: Int = Color.BLACK
-    private var pickerDotColor: Int = Color.BLUE
     private var currentDocumentBaseName: String = "drawing"
     private var manualEraserMode: Boolean = false
-    private var lastBrushBeforeEraser: HardwarePenStyle? = null
-    private var lastColorBeforeEraser: Int? = null
     private var eraserWasActive: Boolean = false
-    private var pendingEraserExitCause: EraserExitCause = EraserExitCause.OTHER
     private var eraserUiTransitionInFlight: Boolean = false
     private var pendingEraserUiTransitionReset: Runnable? = null
     private var pendingIncomingViewUri: Uri? = null
@@ -174,16 +178,21 @@ class MainActivity : AppCompatActivity() {
         rootFrame = findViewById(R.id.rootFrame)
         toolbarRow = findViewById(R.id.toolbarRow)
         penView = findViewById(R.id.penSurfaceView)
-        brushRow = findViewById(R.id.brushButtonRow)
-        widthSeekBar = findViewById(R.id.widthSeekBar)
-        widthValueLabel = findViewById(R.id.widthValueLabel)
+        toolSlotButtons = listOf(
+            findViewById(R.id.toolSlot0),
+            findViewById(R.id.toolSlot1),
+            findViewById(R.id.toolSlot2),
+        )
         zoomValueLabel = findViewById(R.id.zoomValueLabel)
-        swatchBlack = findViewById(R.id.swatchBlack)
-        swatchWhite = findViewById(R.id.swatchWhite)
-        swatchBlue = findViewById(R.id.swatchBlue)
-        colorPickerPanel = findViewById(R.id.colorPickerPanel)
-        colorPickerView = findViewById(R.id.colorPickerView)
-        colorHexValue = findViewById(R.id.textColorHex)
+        toolModalPanel = findViewById(R.id.toolModalPanel)
+        modalColorButton = findViewById(R.id.modalColorButton)
+        modalSizeButton = findViewById(R.id.modalSizeButton)
+        modalColorSection = findViewById(R.id.modalColorSection)
+        modalSizeSection = findViewById(R.id.modalSizeSection)
+        modalColorPickerView = findViewById(R.id.modalColorPickerView)
+        modalColorHexValue = findViewById(R.id.modalColorHexValue)
+        modalSizeSeekBar = findViewById(R.id.modalSizeSeekBar)
+        modalSizeValueLabel = findViewById(R.id.modalSizeValueLabel)
         layerPanel = findViewById(R.id.layerPanel)
         layerDragHandle = findViewById(R.id.layerDragHandle)
         layerRecycler = findViewById(R.id.layerRecycler)
@@ -203,10 +212,9 @@ class MainActivity : AppCompatActivity() {
         val resetViewBtn = findViewById<View>(R.id.buttonResetView)
         val aboutBtn = findViewById<View>(R.id.buttonAbout)
 
-        setupBrushButtons()
-        setupWidthSeekBar()
-        setupColorPickerPanel()
-        setupColorSwatches()
+        setupToolSlots()
+        setupToolModal()
+        setupBrushGrid()
         setupLayerPanel()
         setupLayerPanelDrag()
         penView.setOnViewportChangedListener { scale ->
@@ -214,7 +222,6 @@ class MainActivity : AppCompatActivity() {
         }
         zoomValueLabel.setOnClickListener { resetViewport() }
 
-        guardRawMode(widthSeekBar)
         guardRawMode(zoomValueLabel)
         guardRawMode(loadBtn)
         guardRawMode(clearLayerBtn)
@@ -224,17 +231,15 @@ class MainActivity : AppCompatActivity() {
         guardRawMode(shareBtn)
         guardRawMode(resetViewBtn)
         guardRawMode(aboutBtn)
-        guardRawMode(swatchBlack)
-        guardRawMode(swatchWhite)
-        guardRawMode(swatchBlue)
         guardRawMode(buttonLayers)
         guardRawMode(buttonEraser)
         guardRawMode(buttonAddLayer)
         guardRawMode(buttonRemoveLayer)
         guardRawMode(layerRecycler)
         guardRawMode(fileMenuPanel)
-        guardRawMode(colorPickerPanel)
-        guardRawMode(colorPickerView)
+        guardRawMode(toolModalPanel)
+        guardRawMode(modalColorPickerView)
+        toolSlotButtons.forEach { guardRawMode(it) }
 
         loadBtn.setOnClickListener {
             fileMenuPanel.visibility = View.GONE
@@ -305,7 +310,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        selectBrush(HardwarePenStyle.PENCIL)
+        applyActiveToolToPenView()
+        refreshToolSlotVisuals()
         refreshLayerPanel()
         ensureOverlayOrder()
         updateRawSuppression()
@@ -319,28 +325,178 @@ class MainActivity : AppCompatActivity() {
         handleIncomingViewIntent(intent)
     }
 
-    private fun setupBrushButtons() {
-        HardwarePenStyle.entries.forEach { style ->
+    // ─── Tool slots (3 independently-configured pens) ─────────────────────────
+
+    private fun setupToolSlots() {
+        toolSlotButtons.forEachIndexed { index, btn ->
+            btn.setOnClickListener { onToolSlotClicked(index) }
+        }
+    }
+
+    /**
+     * Tapping an unselected slot makes it the active tool (and exits eraser mode, same as brush
+     * selection always did). Tapping the already-selected slot (while not erasing) instead opens
+     * the edit modal for it - tap again to close it.
+     */
+    private fun onToolSlotClicked(index: Int) {
+        val wasErasing = penView.isEraseModeActive()
+        if (selectedToolIndex != index || wasErasing) {
+            selectedToolIndex = index
+            if (wasErasing) {
+                manualEraserMode = false
+                // deactivateEraserMode() synchronously invokes the eraser-mode listener below,
+                // which calls applyActiveToolToPenView() for the newly selected index.
+                penView.deactivateEraserMode()
+            } else {
+                applyActiveToolToPenView()
+            }
+            refreshToolSlotVisuals()
+            closeToolModal()
+            return
+        }
+        if (toolModalPanel.visibility == View.VISIBLE) closeToolModal() else openToolModal()
+    }
+
+    private fun applyActiveToolToPenView() {
+        val preset = toolPresets[selectedToolIndex]
+        penView.setStyle(preset.style)
+        penView.setStrokeColor(preset.color)
+        penView.setStrokeWidthPx(preset.widthPx)
+    }
+
+    private fun openToolModal() {
+        layerPanel.visibility = View.GONE
+        fileMenuPanel.visibility = View.GONE
+        toolModalPanel.visibility = View.VISIBLE
+        refreshModalContents()
+        ensureOverlayOrder()
+        updateRawSuppression()
+    }
+
+    private fun closeToolModal() {
+        if (toolModalPanel.visibility != View.VISIBLE) return
+        toolModalPanel.visibility = View.GONE
+        hideToolModalSections()
+        updateRawSuppression()
+    }
+
+    private fun hideToolModalSections() {
+        modalColorSection.visibility = View.GONE
+        modalSizeSection.visibility = View.GONE
+    }
+
+    private fun refreshModalContents() {
+        val preset = toolPresets[selectedToolIndex]
+        modalColorButton.background = createSwatchDrawable(preset.color, selected = false)
+        modalSizeButton.text = "Size: ${preset.widthPx.roundToInt()} px"
+        modalSizeSeekBar.progress = widthToProgress(preset.widthPx)
+        modalSizeValueLabel.text = "${preset.widthPx.roundToInt()} px"
+        modalColorPickerView.setColor(preset.color)
+        modalColorHexValue.text = formatHex(preset.color)
+        refreshBrushGridHighlight()
+    }
+
+    private fun refreshBrushGridHighlight() {
+        val preset = toolPresets[selectedToolIndex]
+        brushGridButtons.forEach { (style, btn) ->
+            val selected = style == preset.style
+            btn.alpha = if (selected) 1f else 0.55f
+            btn.background = toolSlotBackground(active = selected)
+        }
+    }
+
+    /**
+     * Each toolbar slot shows the icon for its own brush, tinted to its own ink color - doubles
+     * as the "current state" indicator the whole feature is built around. Always keeps a faint
+     * outline so the button stays visible even if a slot's color happens to be near-white.
+     */
+    private fun refreshToolSlotVisuals() {
+        val eraseActive = penView.isEraseModeActive()
+        toolSlotButtons.forEachIndexed { index, btn ->
+            val preset = toolPresets[index]
+            val active = !eraseActive && index == selectedToolIndex
+            btn.setImageResource(brushIconRes(preset.style))
+            btn.imageTintList = ColorStateList.valueOf(preset.color)
+            btn.alpha = if (active) 1f else 0.55f
+            btn.background = toolSlotBackground(active = active)
+        }
+        updateEraserButtonVisual(eraseActive)
+    }
+
+    private fun toolSlotBackground(active: Boolean): GradientDrawable = GradientDrawable().apply {
+        cornerRadius = dpF(8f)
+        setColor(if (active) Color.parseColor("#15000000") else Color.TRANSPARENT)
+        setStroke(dp(1), if (active) Color.parseColor("#55000000") else Color.parseColor("#22000000"))
+    }
+
+    // ─── Tool modal: size/color quick controls + brush grid ───────────────────
+
+    private fun setupToolModal() {
+        modalColorButton.setOnClickListener {
+            modalSizeSection.visibility = View.GONE
+            modalColorSection.visibility = if (modalColorSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        modalSizeButton.setOnClickListener {
+            modalColorSection.visibility = View.GONE
+            modalSizeSection.visibility = if (modalSizeSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        modalColorPickerView.onColorChanged = { color ->
+            toolPresets[selectedToolIndex].color = color
+            penView.setStrokeColor(color)
+            modalColorButton.background = createSwatchDrawable(color, selected = false)
+            modalColorHexValue.text = formatHex(color)
+            refreshToolSlotVisuals()
+        }
+        modalSizeSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                val width = progressToWidth(progress)
+                toolPresets[selectedToolIndex].widthPx = width
+                modalSizeButton.text = "Size: ${width.roundToInt()} px"
+                modalSizeValueLabel.text = "${width.roundToInt()} px"
+                penView.setStrokeWidthPx(width)
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar) = Unit
+            override fun onStopTrackingTouch(sb: SeekBar) = Unit
+        })
+        guardRawMode(modalSizeSeekBar)
+    }
+
+    private fun setupBrushGrid() {
+        val row1 = findViewById<LinearLayout>(R.id.brushGridRow1)
+        val row2 = findViewById<LinearLayout>(R.id.brushGridRow2)
+        val perRow = (HardwarePenStyle.entries.size + 1) / 2
+        HardwarePenStyle.entries.forEachIndexed { index, style ->
             val btn = ImageButton(this).apply {
                 setImageResource(brushIconRes(style))
-                background = null
-                setPadding(dp(2), dp(2), dp(2), dp(2))
-                scaleType = ImageView.ScaleType.MATRIX
+                setColorFilter(Color.BLACK)
+                background = toolSlotBackground(active = false)
+                scaleType = ImageView.ScaleType.FIT_CENTER
                 contentDescription = style.label
-                alpha = 0.45f
-                setOnClickListener { selectBrush(style) }
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                setOnClickListener { onGridBrushSelected(style) }
             }
-            updateBrushIconTransform(btn, selected = false)
             guardRawMode(btn)
-            brushButtons[style] = btn
-            brushRow.addView(
+            brushGridButtons[style] = btn
+            val row = if (index < perRow) row1 else row2
+            row.addView(
                 btn,
-                LinearLayout.LayoutParams(
-                    dp(36),
-                    dp(44)
-                ).also { it.marginEnd = dp(2) }
+                LinearLayout.LayoutParams(0, dp(56), 1f).also {
+                    if (index % perRow != 0) it.marginStart = dp(4)
+                }
             )
         }
+    }
+
+    private fun onGridBrushSelected(style: HardwarePenStyle) {
+        val preset = toolPresets[selectedToolIndex]
+        preset.style = style
+        preset.widthPx = style.defaultWidthPx
+        penView.setStyle(style)
+        penView.setStrokeWidthPx(preset.widthPx)
+        refreshModalContents()
+        refreshToolSlotVisuals()
     }
 
     private fun brushIconRes(style: HardwarePenStyle): Int = when (style) {
@@ -457,8 +613,7 @@ class MainActivity : AppCompatActivity() {
     private fun toggleLayerPanel() {
         val willShow = layerPanel.visibility != View.VISIBLE
         if (willShow) {
-            colorPickerPanel.visibility = View.GONE
-            refreshPickerToggleSwatch(active = false)
+            closeToolModal()
         }
         layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         if (willShow) refreshLayerPanel()
@@ -466,21 +621,11 @@ class MainActivity : AppCompatActivity() {
         updateRawSuppression()
     }
 
-    private fun toggleColorPickerPanel() {
-        val willShow = colorPickerPanel.visibility != View.VISIBLE
-        if (willShow) {
-            layerPanel.visibility = View.GONE
-            colorPickerView.setColor(pickerDotColor)
-            colorHexValue.text = formatHex(pickerDotColor)
-        }
-        colorPickerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
-        refreshPickerToggleSwatch(active = willShow)
-        ensureOverlayOrder()
-        updateRawSuppression()
-    }
-
     private fun toggleFileMenu() {
         val willShow = fileMenuPanel.visibility != View.VISIBLE
+        if (willShow) {
+            closeToolModal()
+        }
         fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()
         updateRawSuppression()
@@ -488,7 +633,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun ensureOverlayOrder() {
         layerPanel.bringToFront()
-        colorPickerPanel.bringToFront()
+        toolModalPanel.bringToFront()
         fileMenuPanel.bringToFront()
     }
 
@@ -496,48 +641,14 @@ class MainActivity : AppCompatActivity() {
         layerAdapter.submit(penView.getLayerInfos())
     }
 
-    private fun selectBrush(style: HardwarePenStyle) {
-        if (penView.isEraseModeActive()) {
-            pendingEraserExitCause = EraserExitCause.BRUSH_SELECTION
-            manualEraserMode = false
-            penView.deactivateEraserMode()
-        }
-        applyBrushSelection(style)
-    }
-
-    private fun applyBrushSelection(style: HardwarePenStyle) {
-        selectedBrushStyle = style
-        penView.setStyle(style)
-        val width = brushWidths[style] ?: style.defaultWidthPx
-        penView.setStrokeWidthPx(width)
-        widthSeekBar.progress = widthToProgress(width)
-        widthValueLabel.text = "${width.roundToInt()} px"
-
-        selectedBrushBtn = brushButtons[style]
-        refreshToolVisuals(penView.isEraseModeActive())
-    }
-
     private fun toggleManualEraserMode() {
         if (!manualEraserMode) {
             manualEraserMode = true
-            pendingEraserExitCause = EraserExitCause.OTHER
             penView.setManualEraserMode(true)
             return
         }
-
-        pendingEraserExitCause = EraserExitCause.OTHER
         manualEraserMode = false
         penView.setManualEraserMode(false)
-    }
-
-    private fun refreshToolVisuals(eraseActive: Boolean) {
-        brushButtons.forEach { (style, btn) ->
-            val selected = !eraseActive && style == selectedBrushStyle
-            btn.alpha = if (selected) 1f else 0.45f
-            btn.translationY = if (selected) dp(4).toFloat() else 0f
-            updateBrushIconTransform(btn, selected = selected)
-        }
-        updateEraserButtonVisual(eraseActive)
     }
 
     private fun updateEraserButtonVisual(active: Boolean) {
@@ -546,109 +657,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Brush-tip icons use ScaleType.MATRIX (their intrinsic size is bigger than the button so only
-     * the "tip" is visible, popping up as if held). BOOX_ICON_SCALE enlarges that tip proportionally
-     * with the bigger buttons on this app's larger 6" touch targets - MATRIX doesn't auto-scale to
-     * the view like other scale types do, so this has to be done explicitly via the matrix.
+     * Whatever caused eraser mode to end (a tool slot tap, the stylus tip flipping back from its
+     * eraser end, toggling the eraser button off), the currently-selected tool preset already
+     * reflects what should now be active - re-applying it is simpler and equally correct in every
+     * case than the old per-cause "restore the previous brush/color" bookkeeping.
      */
-    private fun updateBrushIconTransform(button: ImageButton, selected: Boolean) {
-        val shiftY = if (selected) dpF(-10.5f) else dpF(-15f)
-        button.imageMatrix = Matrix().apply {
-            setScale(BRUSH_ICON_SCALE, BRUSH_ICON_SCALE)
-            postTranslate(0f, shiftY)
-        }
-    }
-
-    private fun setupWidthSeekBar() {
-        widthSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                val width = progressToWidth(progress)
-                widthValueLabel.text = "${width.roundToInt()} px"
-                brushWidths[selectedBrushStyle] = width
-                penView.setStrokeWidthPx(width)
-            }
-
-            override fun onStartTrackingTouch(sb: SeekBar) = Unit
-            override fun onStopTrackingTouch(sb: SeekBar) = Unit
-        })
-    }
-
-    private fun setupColorPickerPanel() {
-        colorPickerView.onColorChanged = { color ->
-            applyColor(color, swatch = null, syncPicker = false)
-        }
-        colorHexValue.text = formatHex(currentInkColor)
-        colorPickerView.setColor(pickerDotColor)
-    }
-
-    private fun setupColorSwatches() {
-        bindColorSwatch(swatchBlack, Color.BLACK)
-        bindColorSwatch(swatchWhite, Color.WHITE)
-        swatchBlue.setOnClickListener { toggleColorPickerPanel() }
-        refreshPickerToggleSwatch(active = false)
-        applyColor(currentInkColor, swatch = swatchBlack, syncPicker = false)
-    }
-
-    private fun bindColorSwatch(swatch: View, color: Int) {
-        swatch.setOnClickListener { applyColor(color, swatch, syncPicker = true) }
-        swatch.background = createSwatchDrawable(color, selected = false)
-    }
-
-    private fun applyColor(color: Int, swatch: View?, syncPicker: Boolean) {
-        if (penView.isEraseModeActive()) {
-            pendingEraserExitCause = EraserExitCause.COLOR_SELECTION
-            manualEraserMode = false
-            penView.deactivateEraserMode()
-        }
-        currentInkColor = Color.rgb(Color.red(color), Color.green(color), Color.blue(color))
-        penView.setStrokeColor(color)
-        val previous = selectedColorSwatch
-        previous?.background = createSwatchDrawable(selectedInkColorOf(previous), selected = false)
-        if (swatch != null) {
-            swatch.background = createSwatchDrawable(selectedInkColorOf(swatch), selected = true)
-        }
-        selectedColorSwatch = swatch
-        if (swatch == null) {
-            pickerDotColor = currentInkColor
-        }
-        colorHexValue.text = formatHex(currentInkColor)
-        refreshPickerToggleSwatch(active = colorPickerPanel.visibility == View.VISIBLE)
-        if (syncPicker) {
-            colorPickerView.setColor(currentInkColor)
-        }
-    }
-
     private fun onEraserModeChanged(active: Boolean) {
         if (active == eraserWasActive) return
-        if (active) {
-            lastBrushBeforeEraser = selectedBrushStyle
-            lastColorBeforeEraser = currentInkColor
-            pendingEraserExitCause = EraserExitCause.OTHER
-            eraserWasActive = true
-            return
+        eraserWasActive = active
+        if (!active) {
+            manualEraserMode = false
+            applyActiveToolToPenView()
         }
-
-        val exitCause = pendingEraserExitCause
-        pendingEraserExitCause = EraserExitCause.OTHER
-        manualEraserMode = false
-
-        if (exitCause != EraserExitCause.BRUSH_SELECTION) {
-            val restoreBrush = lastBrushBeforeEraser ?: selectedBrushStyle
-            applyBrushSelection(restoreBrush)
-        }
-        if (exitCause != EraserExitCause.COLOR_SELECTION) {
-            val restoreColor = lastColorBeforeEraser
-            if (restoreColor != null) {
-                val restoreSwatch = when (restoreColor) {
-                    Color.BLACK -> swatchBlack
-                    Color.WHITE -> swatchWhite
-                    else -> null
-                }
-                applyColor(restoreColor, swatch = restoreSwatch, syncPicker = true)
-            }
-        }
-        eraserWasActive = false
     }
 
     private fun applyEraserModeUiTransition(active: Boolean) {
@@ -657,7 +677,7 @@ class MainActivity : AppCompatActivity() {
         updateRawSuppression()
 
         onEraserModeChanged(active)
-        refreshToolVisuals(active)
+        refreshToolSlotVisuals()
         refreshToolbarEinkImmediately()
 
         pendingEraserUiTransitionReset?.let { rootFrame.removeCallbacks(it) }
@@ -667,11 +687,6 @@ class MainActivity : AppCompatActivity() {
         }
         pendingEraserUiTransitionReset = reset
         rootFrame.postDelayed(reset, 48L)
-    }
-
-    private fun selectedInkColorOf(swatch: View?): Int = when (swatch?.id) {
-        R.id.swatchWhite -> Color.WHITE
-        else -> Color.BLACK
     }
 
     private fun createSwatchDrawable(fill: Int, selected: Boolean): GradientDrawable {
@@ -688,24 +703,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createPickerToggleDrawable(active: Boolean, fillColor: Int): GradientDrawable {
-        return GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(fillColor)
-            setStroke(if (active) dp(2) else dp(1), if (active) Color.WHITE else Color.LTGRAY)
-        }
-    }
-
-    private fun refreshPickerToggleSwatch(active: Boolean) {
-        swatchBlue.background = createPickerToggleDrawable(active = active, fillColor = pickerDotColor)
-    }
-
     private fun formatHex(color: Int): String =
         String.format("#%02X%02X%02X", Color.red(color), Color.green(color), Color.blue(color))
 
     private fun refreshToolbarEinkImmediately() {
         toolbarRow.invalidate()
-        brushRow.invalidate()
         buttonEraser.invalidate()
         // Refresh only the toolbar strip, not the full decor view - refreshing the whole window
         // also flashes the drawing canvas underneath and doubles the work for no visual benefit.
@@ -1163,7 +1165,7 @@ class MainActivity : AppCompatActivity() {
             eraserUiTransitionInFlight ||
             uiTouchDepth > 0 ||
             layerPanel.visibility == View.VISIBLE ||
-            colorPickerPanel.visibility == View.VISIBLE ||
+            toolModalPanel.visibility == View.VISIBLE ||
             fileMenuPanel.visibility == View.VISIBLE
         penView.setRawInputSuppressed(suppress)
     }
@@ -1274,16 +1276,16 @@ class MainActivity : AppCompatActivity() {
             dismissed = true
         }
 
-        if (colorPickerPanel.visibility == View.VISIBLE &&
-            !isPointInsideView(colorPickerPanel, rawX, rawY) &&
-            !isPointInsideView(swatchBlue, rawX, rawY)
+        if (toolModalPanel.visibility == View.VISIBLE &&
+            !isPointInsideView(toolModalPanel, rawX, rawY) &&
+            toolSlotButtons.none { isPointInsideView(it, rawX, rawY) }
         ) {
-            colorPickerPanel.visibility = View.GONE
+            toolModalPanel.visibility = View.GONE
+            hideToolModalSections()
             dismissed = true
         }
 
         if (dismissed) {
-            refreshPickerToggleSwatch(active = colorPickerPanel.visibility == View.VISIBLE)
             updateRawSuppression()
             refreshUiAfterOverlayDismiss()
         }
