@@ -114,6 +114,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     private var rawInputSuppressed = false
     private var manualEraserMode = false
     private var stylusTipEraserMode = false
+    private var sideButtonEraserMode = false
     private var eraseModeListener: ((Boolean) -> Unit)? = null
     private var stylusHoverButtonListener: ((StylusHoverButtonState) -> Unit)? = null
     private var twoFingerTapListener: (() -> Unit)? = null
@@ -292,7 +293,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         }
     }
 
-    fun isEraseModeActive(): Boolean = manualEraserMode || stylusTipEraserMode
+    fun isEraseModeActive(): Boolean = manualEraserMode || stylusTipEraserMode || sideButtonEraserMode
 
     fun getViewScale(): Float = viewScale
 
@@ -599,6 +600,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         updateStylusTipEraserMode(event)
+        updateSideButtonEraserMode(event)
         logStylusMotionEvent(event, "touch")
         dispatchStylusHoverButtonState(event, "touch")
         if (rawInputSuppressed) {
@@ -631,6 +633,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         updateStylusTipEraserMode(event)
+        updateSideButtonEraserMode(event)
         logStylusMotionEvent(event, "generic")
         val handledStylus = dispatchStylusHoverButtonState(event, "generic")
         return handledStylus || super.onGenericMotionEvent(event)
@@ -1348,6 +1351,36 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
         val shouldEnable = eventHasEraser(event)
         setStylusTipEraserMode(shouldEnable)
+    }
+
+    /**
+     * Holding the stylus's side button acts as a temporary eraser, same idea as flipping to the
+     * eraser tip. Read directly from MotionEvent.buttonState (not the hover-button dispatch
+     * below) because hover tracking deliberately zeroes out once the pen is actually touching -
+     * this needs to work while a stroke is in progress, not just while hovering. Not certain which
+     * physical button Boox's stylus reports as - primary and secondary are both treated as the
+     * erase button so either works; narrow this to one if it turns out to be too sensitive (e.g.
+     * if one of the two is also used for something else).
+     */
+    private fun updateSideButtonEraserMode(event: MotionEvent) {
+        val hasStylusSource = (event.source and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS
+        val hasStylusPointer = eventHasStylus(event)
+        if (!hasStylusSource && !hasStylusPointer) return
+
+        val pressed = (event.buttonState and
+            (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_STYLUS_SECONDARY)) != 0
+        setSideButtonEraserMode(pressed)
+    }
+
+    private fun setSideButtonEraserMode(enabled: Boolean) {
+        if (sideButtonEraserMode == enabled) return
+        val before = isEraseModeActive()
+        sideButtonEraserMode = enabled
+        val after = isEraseModeActive()
+        if (before != after) {
+            eraseModeListener?.invoke(after)
+            reconfigureTouchHelper()
+        }
     }
 
     private fun setStylusTipEraserMode(enabled: Boolean, reconfigure: Boolean = true) {

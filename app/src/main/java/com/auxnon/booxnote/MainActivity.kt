@@ -330,6 +330,10 @@ class MainActivity : AppCompatActivity() {
     private fun setupToolSlots() {
         toolSlotButtons.forEachIndexed { index, btn ->
             btn.setOnClickListener { onToolSlotClicked(index) }
+            btn.setOnLongClickListener {
+                onToolSlotLongPressed(index)
+                true
+            }
         }
     }
 
@@ -339,22 +343,36 @@ class MainActivity : AppCompatActivity() {
      * the edit modal for it - tap again to close it.
      */
     private fun onToolSlotClicked(index: Int) {
-        val wasErasing = penView.isEraseModeActive()
-        if (selectedToolIndex != index || wasErasing) {
-            selectedToolIndex = index
-            if (wasErasing) {
-                manualEraserMode = false
-                // deactivateEraserMode() synchronously invokes the eraser-mode listener below,
-                // which calls applyActiveToolToPenView() for the newly selected index.
-                penView.deactivateEraserMode()
-            } else {
-                applyActiveToolToPenView()
-            }
-            refreshToolSlotVisuals()
+        if (makeToolSlotActive(index)) {
             closeToolModal()
             return
         }
         if (toolModalPanel.visibility == View.VISIBLE) closeToolModal() else openToolModal()
+    }
+
+    /** Long-pressing any slot - selected or not - jumps straight to editing it, skipping the
+     *  "tap to select, tap again to edit" two-step for slots that aren't already active. */
+    private fun onToolSlotLongPressed(index: Int) {
+        makeToolSlotActive(index)
+        openToolModal()
+    }
+
+    /** Switches the active tool to [index] if it wasn't already (also exiting eraser mode, since
+     *  any brush selection always does). Returns true if a switch actually happened. */
+    private fun makeToolSlotActive(index: Int): Boolean {
+        val wasErasing = penView.isEraseModeActive()
+        if (selectedToolIndex == index && !wasErasing) return false
+        selectedToolIndex = index
+        if (wasErasing) {
+            manualEraserMode = false
+            // deactivateEraserMode() synchronously invokes the eraser-mode listener below, which
+            // calls applyActiveToolToPenView() for the newly selected index.
+            penView.deactivateEraserMode()
+        } else {
+            applyActiveToolToPenView()
+        }
+        refreshToolSlotVisuals()
+        return true
     }
 
     private fun applyActiveToolToPenView() {
