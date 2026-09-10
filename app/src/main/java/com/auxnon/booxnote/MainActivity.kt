@@ -1,5 +1,8 @@
 package com.auxnon.booxnote
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.Dialog
 import android.content.ClipData
@@ -63,11 +66,18 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_LAST_OPEN_URI = "last_open_uri"
         private const val UI_TOUCH_WATCHDOG_MS = 4000L
         private const val TOOL_SLOT_COUNT = 3
+        private const val TOOLBAR_ANIM_DURATION_MS = 220L
+        private const val TOOLBAR_TAP_MAX_MOVEMENT_DP = 12f
+        private const val TOOLBAR_TAP_MAX_DURATION_MS = 300L
+        private const val TOOLBAR_EDGE_MARGIN_DP = 8f
+        private const val POPUP_MARGIN_DP = 10f
     }
 
     private lateinit var penView: HardwarePenSurfaceView
     private lateinit var rootFrame: View
-    private lateinit var toolbarRow: View
+    private lateinit var toolbarPill: View
+    private lateinit var toolbarHandle: ImageButton
+    private lateinit var toolbarContentGroup: View
     private lateinit var toolSlotButtons: List<ImageButton>
     private lateinit var zoomValueLabel: TextView
     private lateinit var toolModalPanel: View
@@ -121,6 +131,21 @@ class MainActivity : AppCompatActivity() {
         ToolPreset(HardwarePenStyle.MARKER, Color.BLACK, HardwarePenStyle.MARKER.defaultWidthPx),
     )
     private var selectedToolIndex: Int = 0
+
+    // Floating toolbar: drag-to-move, tap-handle-to-minimize/expand, snap-to-edge on release.
+    private var toolbarMinimized = false
+    private var toolbarExpandedWidth = 0
+    private var toolbarExpandedHeight = 0
+    private var toolbarCollapsedWidth = 0
+    private var toolbarCollapsedHeight = 0
+    private var toolbarDragStartRawX = 0f
+    private var toolbarDragStartRawY = 0f
+    private var toolbarDragStartViewX = 0f
+    private var toolbarDragStartViewY = 0f
+    private var toolbarDragMaxMovement = 0f
+    private var toolbarDragStartTimeMs = 0L
+    private var uiEinkRefreshScheduled = false
+
     private var pickerInFlight: Boolean = false
     private var activityPaused: Boolean = false
     private var uiTouchDepth: Int = 0
@@ -176,7 +201,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         rootFrame = findViewById(R.id.rootFrame)
-        toolbarRow = findViewById(R.id.toolbarRow)
+        toolbarPill = findViewById(R.id.toolbarPill)
+        toolbarHandle = findViewById(R.id.toolbarHandle)
+        toolbarContentGroup = findViewById(R.id.toolbarContentGroup)
         penView = findViewById(R.id.penSurfaceView)
         toolSlotButtons = listOf(
             findViewById(R.id.toolSlot0),
@@ -212,6 +239,7 @@ class MainActivity : AppCompatActivity() {
         val resetViewBtn = findViewById<View>(R.id.buttonResetView)
         val aboutBtn = findViewById<View>(R.id.buttonAbout)
 
+        setupToolbarPill()
         setupToolSlots()
         setupToolModal()
         setupBrushGrid()
@@ -325,6 +353,217 @@ class MainActivity : AppCompatActivity() {
         handleIncomingViewIntent(intent)
     }
 
+    // ─── Floating toolbar: drag, minimize/expand, edge-snap ───────────────────
+
+    private fun setupToolbarPill() {
+        // Collapsed (minimized) size is computed analytically from the handle's own fixed size
+        // plus the pill's padding, rather than by actually hiding content and re-measuring -
+        // avoids any visibility-timing flicker since nothing here depends on runtime content.
+        toolbarPill.post {
+            toolbarExpandedWidth = toolbarPill.width
+            toolbarExpandedHeight = toolbarPill.height
+            toolbarCollapsedWidth = toolbarHandle.width + toolbarPill.paddingStart + toolbarPill.paddingEnd
+            toolbarCollapsedHeight = toolbarHandle.height + toolbarPill.paddingTop + toolbarPill.paddingBottom
+        }
+
+        toolbarHandle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    beginUiTouch()
+                    toolbarDragStartRawX = event.rawX
+                    toolbarDragStartRawY = event.rawY
+                    toolbarDragStartViewX = toolbarPill.x
+                    toolbarDragStartViewY = toolbarPill.y
+                    toolbarDragMaxMovement = 0f
+                    toolbarDragStartTimeMs = System.currentTimeMillis()
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - toolbarDragStartRawX
+                    val dy = event.rawY - toolbarDragStartRawY
+                    toolbarDragMaxMovement = maxOf(toolbarDragMaxMovement, sqrt(dx * dx + dy * dy))
+                    moveToolbarPill(toolbarDragStartViewX + dx, toolbarDragStartViewY + dy)
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    endUiTouch(false)
+                    val elapsed = System.currentTimeMillis() - toolbarDragStartTimeMs
+                    val wasTap = toolbarDragMaxMovement < dpF(TOOLBAR_TAP_MAX_MOVEMENT_DP) &&
+                        elapsed < TOOLBAR_TAP_MAX_DURATION_MS
+                    if (wasTap) toggleToolbarMinimized() else snapToolbarToNearestEdge()
+                    true
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    endUiTouch(true)
+                    snapToolbarToNearestEdge()
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    /** Live 1:1 drag tracking - no animation here, direct manipulation should track the finger
+     *  exactly. Clamped to the current (collapsed or expanded) size so it can't be dragged
+     *  partially off-screen mid-drag. */
+    private fun moveToolbarPill(targetX: Float, targetY: Float) {
+        val parentW = rootFrame.width
+        val parentH = rootFrame.height
+        if (parentW <= 0 || parentH <= 0) return
+        val maxX = (parentW - toolbarPill.width).coerceAtLeast(0)
+        val maxY = (parentH - toolbarPill.height).coerceAtLeast(0)
+        toolbarPill.x = targetX.coerceIn(0f, maxX.toFloat())
+        toolbarPill.y = targetY.coerceIn(0f, maxY.toFloat())
+    }
+
+    /** Animates to whichever of the 4 screen edges is nearest the toolbar's current center,
+     *  flush against it (minus a small margin), clamping the other axis to stay on-screen. */
+    private fun snapToolbarToNearestEdge() {
+        val parentW = rootFrame.width.toFloat()
+        val parentH = rootFrame.height.toFloat()
+        if (parentW <= 0f || parentH <= 0f) return
+        val w = toolbarPill.width.toFloat()
+        val h = toolbarPill.height.toFloat()
+        val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
+        val centerX = toolbarPill.x + w / 2f
+        val centerY = toolbarPill.y + h / 2f
+
+        val distLeft = centerX
+        val distRight = parentW - centerX
+        val distTop = centerY
+        val distBottom = parentH - centerY
+        val minDist = minOf(distLeft, distRight, distTop, distBottom)
+
+        var targetX = toolbarPill.x.coerceIn(0f, (parentW - w).coerceAtLeast(0f))
+        var targetY = toolbarPill.y.coerceIn(0f, (parentH - h).coerceAtLeast(0f))
+        when (minDist) {
+            distLeft -> targetX = margin
+            distRight -> targetX = (parentW - w - margin).coerceAtLeast(margin)
+            distTop -> targetY = margin
+            else -> targetY = (parentH - h - margin).coerceAtLeast(margin)
+        }
+        toolbarPill.animate().x(targetX).y(targetY).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+    }
+
+    private fun toggleToolbarMinimized() {
+        if (toolbarMinimized) expandToolbar() else minimizeToolbar()
+    }
+
+    private fun minimizeToolbar() {
+        if (toolbarMinimized) return
+        toolbarMinimized = true
+        repositionForSize(toolbarCollapsedWidth, toolbarCollapsedHeight)
+        toolbarContentGroup.animate().alpha(0f).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+        animatePillSize(toolbarPill.width, toolbarPill.height, toolbarCollapsedWidth, toolbarCollapsedHeight) {
+            toolbarContentGroup.visibility = View.GONE
+            toolbarContentGroup.alpha = 1f
+        }
+    }
+
+    /** Reveals content BEFORE the size grows (so it fades in as the pill widens, rather than
+     *  popping in once fully expanded), and proactively slides the pill so the full expanded
+     *  bounds stay on-screen throughout the animation instead of only clamping at the end. */
+    private fun expandToolbar() {
+        if (!toolbarMinimized) return
+        toolbarMinimized = false
+        repositionForSize(toolbarExpandedWidth, toolbarExpandedHeight)
+        toolbarContentGroup.visibility = View.VISIBLE
+        toolbarContentGroup.alpha = 0f
+        toolbarContentGroup.animate().alpha(1f).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+        animatePillSize(toolbarPill.width, toolbarPill.height, toolbarExpandedWidth, toolbarExpandedHeight) {}
+    }
+
+    /** Slides the pill (animated) so a box of [targetW]x[targetH] anchored at its current
+     *  top-left stays fully within the screen - used before growing so expansion never runs off
+     *  an edge, even transiently mid-animation. */
+    private fun repositionForSize(targetW: Int, targetH: Int) {
+        val parentW = rootFrame.width
+        val parentH = rootFrame.height
+        if (parentW <= 0 || parentH <= 0) return
+        val maxX = (parentW - targetW).coerceAtLeast(0)
+        val maxY = (parentH - targetH).coerceAtLeast(0)
+        val targetX = toolbarPill.x.coerceIn(0f, maxX.toFloat())
+        val targetY = toolbarPill.y.coerceIn(0f, maxY.toFloat())
+        if (targetX != toolbarPill.x || targetY != toolbarPill.y) {
+            toolbarPill.animate().x(targetX).y(targetY).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+        }
+    }
+
+    private fun animatePillSize(fromW: Int, fromH: Int, toW: Int, toH: Int, onEnd: () -> Unit) {
+        val animator = ValueAnimator.ofFloat(0f, 1f)
+        animator.duration = TOOLBAR_ANIM_DURATION_MS
+        animator.addUpdateListener { anim ->
+            val t = anim.animatedValue as Float
+            val lp = toolbarPill.layoutParams
+            lp.width = (fromW + (toW - fromW) * t).roundToInt()
+            lp.height = (fromH + (toH - fromH) * t).roundToInt()
+            toolbarPill.layoutParams = lp
+        }
+        animator.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) = onEnd()
+        })
+        animator.start()
+    }
+
+    /**
+     * Positions [popup] just below the toolbar (left-aligned with it), flipping above and/or
+     * clamping horizontally if there isn't room - called once, synchronously, right before making
+     * a panel visible so there's no flash at a stale position. Popups keep their own size (fixed
+     * width, wrap_content height) regardless of the toolbar's minimized/expanded state.
+     */
+    private fun positionPopupNearToolbar(popup: View) {
+        val parentW = rootFrame.width
+        val parentH = rootFrame.height
+        if (parentW <= 0 || parentH <= 0) return
+        popup.measure(
+            View.MeasureSpec.makeMeasureSpec(parentW, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(parentH, View.MeasureSpec.AT_MOST)
+        )
+        val popupW = popup.measuredWidth
+        val popupH = popup.measuredHeight
+        val margin = dpF(POPUP_MARGIN_DP)
+
+        val toolbarTop = toolbarPill.y
+        val toolbarBottom = toolbarTop + toolbarPill.height
+
+        var targetY = toolbarBottom + margin
+        if (targetY + popupH > parentH) {
+            val above = toolbarTop - margin - popupH
+            targetY = if (above >= 0f) above else (parentH - popupH).toFloat().coerceAtLeast(0f)
+        }
+        var targetX = toolbarPill.x
+        if (targetX + popupW > parentW) targetX = (parentW - popupW - margin).coerceAtLeast(margin)
+        if (targetX < 0f) targetX = margin
+
+        popup.x = targetX
+        popup.y = targetY
+    }
+
+    /**
+     * Coalesced e-ink refresh for UI-only changes made while a panel stays open (e.g. picking a
+     * color or brush in the tool modal) - those already update the underlying Views correctly,
+     * but on e-ink nothing reaches the physical panel without an explicit EpdController refresh,
+     * same class of bug as the brush-switch/panel-dismiss blanking fixed earlier. Refreshes the
+     * whole decor view (toolbar + modal both need it) rather than one region, and coalesces bursts
+     * (e.g. dragging the color wheel, which fires onColorChanged continuously) into one call.
+     */
+    private fun refreshUiEinkThrottled(mode: UpdateMode = UpdateMode.GC) {
+        if (uiEinkRefreshScheduled) return
+        uiEinkRefreshScheduled = true
+        rootFrame.post {
+            uiEinkRefreshScheduled = false
+            runCatching {
+                val decor = window?.decorView ?: rootFrame
+                EpdController.invalidate(decor, mode)
+                EpdController.refreshScreen(decor, mode)
+            }
+        }
+    }
+
     // ─── Tool slots (3 independently-configured pens) ─────────────────────────
 
     private fun setupToolSlots() {
@@ -385,6 +624,7 @@ class MainActivity : AppCompatActivity() {
     private fun openToolModal() {
         layerPanel.visibility = View.GONE
         fileMenuPanel.visibility = View.GONE
+        positionPopupNearToolbar(toolModalPanel)
         toolModalPanel.visibility = View.VISIBLE
         refreshModalContents()
         ensureOverlayOrder()
@@ -464,6 +704,7 @@ class MainActivity : AppCompatActivity() {
             modalColorButton.background = createSwatchDrawable(color, selected = false)
             modalColorHexValue.text = formatHex(color)
             refreshToolSlotVisuals()
+            refreshUiEinkThrottled()
         }
         modalSizeSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
@@ -515,6 +756,7 @@ class MainActivity : AppCompatActivity() {
         penView.setStrokeWidthPx(preset.widthPx)
         refreshModalContents()
         refreshToolSlotVisuals()
+        refreshUiEinkThrottled()
     }
 
     private fun brushIconRes(style: HardwarePenStyle): Int = when (style) {
@@ -632,6 +874,7 @@ class MainActivity : AppCompatActivity() {
         val willShow = layerPanel.visibility != View.VISIBLE
         if (willShow) {
             closeToolModal()
+            positionPopupNearToolbar(layerPanel)
         }
         layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         if (willShow) refreshLayerPanel()
@@ -643,6 +886,7 @@ class MainActivity : AppCompatActivity() {
         val willShow = fileMenuPanel.visibility != View.VISIBLE
         if (willShow) {
             closeToolModal()
+            positionPopupNearToolbar(fileMenuPanel)
         }
         fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()
@@ -725,18 +969,18 @@ class MainActivity : AppCompatActivity() {
         String.format("#%02X%02X%02X", Color.red(color), Color.green(color), Color.blue(color))
 
     private fun refreshToolbarEinkImmediately() {
-        toolbarRow.invalidate()
+        toolbarPill.invalidate()
         buttonEraser.invalidate()
-        // Refresh only the toolbar strip, not the full decor view - refreshing the whole window
+        // Refresh only the toolbar pill, not the full decor view - refreshing the whole window
         // also flashes the drawing canvas underneath and doubles the work for no visual benefit.
         // Handheld panels (Palma-class) get DU: it's faster and the toolbar is near-monochrome,
         // so DU's lack of gray levels isn't visible, while GU's full flash there is proportionally
         // much more jarring on a small screen than on a tablet-class panel.
         val toolbarUpdateMode = if (isHandheldEinkPanel) UpdateMode.DU else UpdateMode.GU
-        toolbarRow.post {
+        toolbarPill.post {
             runCatching {
-                EpdController.invalidate(toolbarRow, toolbarUpdateMode)
-                EpdController.refreshScreen(toolbarRow, toolbarUpdateMode)
+                EpdController.invalidate(toolbarPill, toolbarUpdateMode)
+                EpdController.refreshScreen(toolbarPill, toolbarUpdateMode)
             }
         }
     }

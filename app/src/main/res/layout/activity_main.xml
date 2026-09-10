@@ -4,158 +4,164 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <LinearLayout
-        android:id="@+id/mainContent"
+    <com.auxnon.booxnote.HardwarePenSurfaceView
+        android:id="@+id/penSurfaceView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:orientation="vertical">
+        android:background="#FFFFFF" />
+
+    <LinearLayout
+        android:id="@+id/toolbarPill"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="10dp"
+        android:background="@drawable/toolbar_pill_background"
+        android:clickable="true"
+        android:elevation="0dp"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="5dp">
+
+        <ImageButton
+            android:id="@+id/toolbarHandle"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="@android:color/transparent"
+            android:contentDescription="Move / minimize toolbar"
+            android:padding="8dp"
+            android:src="@drawable/ic_toolbar_handle" />
 
         <LinearLayout
-            android:layout_width="match_parent"
+            android:id="@+id/toolbarContentGroup"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:background="@drawable/toolbar_white_bottom_line"
+            android:layout_marginStart="4dp"
             android:gravity="center_vertical"
-            android:paddingStart="4dp"
-            android:paddingTop="4dp"
-            android:paddingEnd="4dp"
-            android:paddingBottom="6dp">
+            android:orientation="horizontal">
 
             <LinearLayout
-                android:id="@+id/toolbarRow"
-                android:layout_width="match_parent"
+                android:id="@+id/toolSlotsGroup"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
-                <LinearLayout
-                    android:id="@+id/toolSlotsGroup"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal">
-
-                    <ImageButton
-                        android:id="@+id/toolSlot0"
-                        android:layout_width="48dp"
-                        android:layout_height="48dp"
-                        android:background="@android:color/transparent"
-                        android:contentDescription="Tool 1"
-                        android:padding="9dp"
-                        android:scaleType="fitCenter" />
-
-                    <ImageButton
-                        android:id="@+id/toolSlot1"
-                        android:layout_width="48dp"
-                        android:layout_height="48dp"
-                        android:layout_marginStart="4dp"
-                        android:background="@android:color/transparent"
-                        android:contentDescription="Tool 2"
-                        android:padding="9dp"
-                        android:scaleType="fitCenter" />
-
-                    <ImageButton
-                        android:id="@+id/toolSlot2"
-                        android:layout_width="48dp"
-                        android:layout_height="48dp"
-                        android:layout_marginStart="4dp"
-                        android:background="@android:color/transparent"
-                        android:contentDescription="Tool 3"
-                        android:padding="9dp"
-                        android:scaleType="fitCenter" />
-                </LinearLayout>
-
-                <View
-                    android:layout_width="1dp"
-                    android:layout_height="36dp"
-                    android:layout_marginStart="6dp"
-                    android:layout_marginEnd="6dp"
-                    android:background="#22000000" />
-
                 <ImageButton
-                    android:id="@+id/buttonEraser"
-                    android:layout_width="40dp"
+                    android:id="@+id/toolSlot0"
+                    android:layout_width="48dp"
                     android:layout_height="48dp"
                     android:background="@android:color/transparent"
-                    android:contentDescription="Eraser"
-                    android:paddingStart="4dp"
-                    android:paddingTop="4dp"
-                    android:paddingEnd="4dp"
-                    android:paddingBottom="6dp"
-                    android:src="@drawable/ic_eraser_black_24" />
+                    android:contentDescription="Tool 1"
+                    android:padding="9dp"
+                    android:scaleType="fitCenter" />
 
-                <View
-                    android:layout_width="0dp"
-                    android:layout_height="1dp"
-                    android:layout_weight="1" />
+                <ImageButton
+                    android:id="@+id/toolSlot1"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="4dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="Tool 2"
+                    android:padding="9dp"
+                    android:scaleType="fitCenter" />
 
-                <TextView
-                    android:id="@+id/zoomValueLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginEnd="6dp"
-                    android:background="@drawable/menu_item_background"
-                    android:clickable="true"
-                    android:focusable="true"
-                    android:minWidth="40dp"
-                    android:paddingStart="4dp"
-                    android:paddingTop="4dp"
-                    android:paddingEnd="4dp"
-                    android:paddingBottom="4dp"
-                    android:text="100%"
-                    android:textColor="#222222"
-                    android:textSize="14sp" />
+                <ImageButton
+                    android:id="@+id/toolSlot2"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="4dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="Tool 3"
+                    android:padding="9dp"
+                    android:scaleType="fitCenter" />
+            </LinearLayout>
 
-                <View
-                    android:layout_width="1dp"
-                    android:layout_height="36dp"
+            <View
+                android:layout_width="1dp"
+                android:layout_height="36dp"
+                android:layout_marginStart="6dp"
+                android:layout_marginEnd="6dp"
+                android:background="#22000000" />
+
+            <ImageButton
+                android:id="@+id/buttonEraser"
+                android:layout_width="40dp"
+                android:layout_height="48dp"
+                android:background="@android:color/transparent"
+                android:contentDescription="Eraser"
+                android:paddingStart="4dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="4dp"
+                android:paddingBottom="6dp"
+                android:src="@drawable/ic_eraser_black_24" />
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="36dp"
+                android:layout_marginStart="6dp"
+                android:layout_marginEnd="6dp"
+                android:background="#22000000" />
+
+            <TextView
+                android:id="@+id/zoomValueLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/menu_item_background"
+                android:clickable="true"
+                android:focusable="true"
+                android:minWidth="40dp"
+                android:paddingStart="4dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="4dp"
+                android:paddingBottom="4dp"
+                android:text="100%"
+                android:textColor="#222222"
+                android:textSize="14sp" />
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="36dp"
+                android:layout_marginStart="2dp"
+                android:layout_marginEnd="2dp"
+                android:background="#22000000" />
+
+            <LinearLayout
+                android:id="@+id/topButtonsGroup"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageButton
+                    android:id="@+id/buttonLayers"
+                    android:layout_width="44dp"
+                    android:layout_height="44dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="Layers"
+                    android:padding="8dp"
+                    android:src="@drawable/ic_layers_stack_black_24" />
+
+                <ImageButton
+                    android:id="@+id/buttonMenu"
+                    android:layout_width="44dp"
+                    android:layout_height="44dp"
                     android:layout_marginStart="2dp"
-                    android:layout_marginEnd="2dp"
-                    android:background="#22000000" />
-
-                <LinearLayout
-                    android:id="@+id/topButtonsGroup"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal">
-
-                    <ImageButton
-                        android:id="@+id/buttonLayers"
-                        android:layout_width="44dp"
-                        android:layout_height="44dp"
-                        android:background="@android:color/transparent"
-                        android:contentDescription="Layers"
-                        android:padding="8dp"
-                        android:src="@drawable/ic_layers_stack_black_24" />
-
-                    <ImageButton
-                        android:id="@+id/buttonMenu"
-                        android:layout_width="44dp"
-                        android:layout_height="44dp"
-                        android:layout_marginStart="2dp"
-                        android:background="@android:color/transparent"
-                        android:contentDescription="Menu"
-                        android:padding="8dp"
-                        android:src="@drawable/ic_hamburger_two_lines_black_24" />
-                </LinearLayout>
+                    android:background="@android:color/transparent"
+                    android:contentDescription="Menu"
+                    android:padding="8dp"
+                    android:src="@drawable/ic_hamburger_two_lines_black_24" />
             </LinearLayout>
         </LinearLayout>
-
-        <com.auxnon.booxnote.HardwarePenSurfaceView
-            android:id="@+id/penSurfaceView"
-            android:layout_width="match_parent"
-            android:layout_height="0dp"
-            android:layout_weight="1"
-            android:background="#FFFFFF" />
     </LinearLayout>
 
     <LinearLayout
         android:id="@+id/layerPanel"
         android:layout_width="280dp"
         android:layout_height="380dp"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="80dp"
-        android:layout_marginEnd="10dp"
+        android:layout_gravity="top|start"
         android:background="@drawable/floating_panel_background"
         android:clickable="true"
         android:elevation="0dp"
@@ -212,9 +218,7 @@
         android:id="@+id/toolModalPanel"
         android:layout_width="320dp"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="80dp"
-        android:layout_marginEnd="10dp"
+        android:layout_gravity="top|start"
         android:background="@drawable/floating_panel_background"
         android:clickable="true"
         android:elevation="0dp"
@@ -332,9 +336,7 @@
         android:id="@+id/fileMenuPanel"
         android:layout_width="180dp"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="80dp"
-        android:layout_marginEnd="10dp"
+        android:layout_gravity="top|start"
         android:background="@drawable/floating_panel_background"
         android:clickable="true"
         android:elevation="0dp"
