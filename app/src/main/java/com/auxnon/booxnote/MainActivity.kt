@@ -151,7 +151,6 @@ class MainActivity : AppCompatActivity() {
     private var toolbarDragStartTimeMs = 0L
     private var toolbarDragging = false
     private var toolbarOrientationVertical = false
-    private var uiEinkRefreshScheduled = false
 
     private var pickerInFlight: Boolean = false
     private var activityPaused: Boolean = false
@@ -475,18 +474,21 @@ class MainActivity : AppCompatActivity() {
         toolbarPill.visibility = View.VISIBLE
     }
 
-    /** 3x3 screen split by thirds, classified from the toolbar's center - a standard "snap to
-     *  region" scheme (window snapping, etc.), and simpler/more predictable than measuring exact
-     *  distance to 9 discrete anchor points. */
-    private fun classifyToolbarSnapZone(centerX: Float, centerY: Float, parentW: Float, parentH: Float): ToolbarSnapZone {
+    /** 3x3 split by thirds of how far the toolbar was actually dragged within its OWN achievable
+     *  range (0 = pinned left/top, 1 = pinned right/bottom) - not raw screen thirds. A wide
+     *  expanded toolbar's center can never get close to either screen edge purely because of its
+     *  own width (especially on a narrow portrait phone, where the toolbar can be a large
+     *  fraction of the screen width), which made the outer zones nearly unreachable when
+     *  classified by absolute screen position instead. */
+    private fun classifyToolbarSnapZone(fracX: Float, fracY: Float): ToolbarSnapZone {
         val col = when {
-            centerX < parentW / 3f -> 0
-            centerX > parentW * 2f / 3f -> 2
+            fracX < 1f / 3f -> 0
+            fracX > 2f / 3f -> 2
             else -> 1
         }
         val row = when {
-            centerY < parentH / 3f -> 0
-            centerY > parentH * 2f / 3f -> 2
+            fracY < 1f / 3f -> 0
+            fracY > 2f / 3f -> 2
             else -> 1
         }
         return when (row) {
@@ -505,9 +507,18 @@ class MainActivity : AppCompatActivity() {
         val parentW = rootFrame.width.toFloat()
         val parentH = rootFrame.height.toFloat()
         if (parentW <= 0f || parentH <= 0f) return
-        val centerX = toolbarPill.x + toolbarPill.width / 2f
-        val centerY = toolbarPill.y + toolbarPill.height / 2f
-        val zone = classifyToolbarSnapZone(centerX, centerY, parentW, parentH)
+        val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
+        val w0 = toolbarPill.width.toFloat()
+        val h0 = toolbarPill.height.toFloat()
+        val minX = margin
+        val maxX = (parentW - w0 - margin).coerceAtLeast(minX)
+        val fracX = if (maxX > minX) ((toolbarPill.x - minX) / (maxX - minX)).coerceIn(0f, 1f) else 0.5f
+        val minY = margin
+        val maxY = (parentH - h0 - margin).coerceAtLeast(minY)
+        val fracY = if (maxY > minY) ((toolbarPill.y - minY) / (maxY - minY)).coerceIn(0f, 1f) else 0.5f
+        val centerX = toolbarPill.x + w0 / 2f
+        val centerY = toolbarPill.y + h0 / 2f
+        val zone = classifyToolbarSnapZone(fracX, fracY)
         val wantsVertical = zone == ToolbarSnapZone.LEFT || zone == ToolbarSnapZone.RIGHT ||
             zone == ToolbarSnapZone.TOP_LEFT || zone == ToolbarSnapZone.TOP_RIGHT ||
             zone == ToolbarSnapZone.BOTTOM_LEFT || zone == ToolbarSnapZone.BOTTOM_RIGHT
@@ -529,7 +540,6 @@ class MainActivity : AppCompatActivity() {
             toolbarExpandedHeight = h
         }
 
-        val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
         var targetX = centerX - w / 2f
         var targetY = centerY - h / 2f
         when (zone) {
@@ -553,43 +563,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Re-flows the pill from a horizontal row to a vertical column (or back): toolSlotsGroup and
-     * topButtonsGroup deliberately stay horizontal internally (small 2-3-button clusters), so a
-     * vertical toolbar is a narrow stack of horizontal mini-rows rather than one long single-file
-     * column of every button - keeps it dock-width-appropriate for a side edge.
+     * Re-flows every level of the pill from a horizontal row to a single-file vertical column (or
+     * back) - the tool-slot cluster and the layers/menu cluster reorient along with everything
+     * else, so a side-docked toolbar is a genuinely narrow strip rather than a squarish block
+     * (that squarish shape was the "odd circular pill" when only the outer stack flipped but
+     * those inner 2-3-button rows stayed horizontal, capping how narrow the whole thing could get).
      */
     private fun applyToolbarOrientation(vertical: Boolean) {
         if (toolbarOrientationVertical == vertical) return
         toolbarOrientationVertical = vertical
         val orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
         val gravity = if (vertical) Gravity.CENTER_HORIZONTAL else Gravity.CENTER_VERTICAL
-        val pill = toolbarPill as LinearLayout
-        pill.orientation = orientation
-        pill.gravity = gravity
-        val contentGroup = toolbarContentGroup as LinearLayout
-        contentGroup.orientation = orientation
-        contentGroup.gravity = gravity
 
-        // Handle-to-content gap: marginStart when horizontal, marginTop when stacked vertically.
-        val contentLp = toolbarContentGroup.layoutParams as LinearLayout.LayoutParams
-        val gap = contentLp.marginStart + contentLp.topMargin
-        contentLp.marginStart = if (vertical) 0 else gap
-        contentLp.topMargin = if (vertical) gap else 0
-        toolbarContentGroup.layoutParams = contentLp
+        val groups = listOf(
+            toolbarPill as LinearLayout,
+            toolbarContentGroup as LinearLayout,
+            findViewById<LinearLayout>(R.id.toolSlotsGroup),
+            findViewById<LinearLayout>(R.id.topButtonsGroup),
+        )
+        groups.forEach { group ->
+            group.orientation = orientation
+            group.gravity = gravity
+        }
+
+        // Every "gap from the previous sibling" margin: marginStart when horizontal, marginTop
+        // when stacked vertically. Covers the handle-to-content gap and each button/divider after
+        // the first in its row/column.
+        // buttonEraser and zoomValueLabel aren't included: they have no marginStart of their own
+        // in either orientation - the dividers on both sides already provide their spacing.
+        val gapViews = listOf(
+            toolbarContentGroup,
+            toolSlotButtons[1], toolSlotButtons[2],
+            toolbarDivider1, toolbarDivider2, toolbarDivider3,
+            buttonMenu,
+        )
+        gapViews.forEach { view -> flipStartMarginToTop(view) }
 
         listOf(toolbarDivider1, toolbarDivider2, toolbarDivider3).forEach { divider ->
             val lp = divider.layoutParams as LinearLayout.LayoutParams
             val w = lp.width
             lp.width = lp.height
             lp.height = w
-            val startMargin = lp.marginStart
-            val endMargin = lp.marginEnd
-            lp.marginStart = lp.topMargin
-            lp.marginEnd = lp.bottomMargin
-            lp.topMargin = startMargin
-            lp.bottomMargin = endMargin
             divider.layoutParams = lp
         }
+    }
+
+    private fun flipStartMarginToTop(view: View) {
+        val lp = view.layoutParams as? LinearLayout.LayoutParams ?: return
+        val gap = lp.marginStart + lp.topMargin
+        lp.marginStart = if (toolbarOrientationVertical) 0 else gap
+        lp.topMargin = if (toolbarOrientationVertical) gap else 0
+        view.layoutParams = lp
     }
 
     private fun toggleToolbarMinimized() {
@@ -696,27 +720,6 @@ class MainActivity : AppCompatActivity() {
         popup.y = targetY
     }
 
-    /**
-     * Coalesced e-ink refresh for UI-only changes made while a panel stays open (e.g. picking a
-     * color or brush in the tool modal) - those already update the underlying Views correctly,
-     * but on e-ink nothing reaches the physical panel without an explicit EpdController refresh,
-     * same class of bug as the brush-switch/panel-dismiss blanking fixed earlier. Refreshes the
-     * whole decor view (toolbar + modal both need it) rather than one region, and coalesces bursts
-     * (e.g. dragging the color wheel, which fires onColorChanged continuously) into one call.
-     */
-    private fun refreshUiEinkThrottled(mode: UpdateMode = UpdateMode.GC) {
-        if (uiEinkRefreshScheduled) return
-        uiEinkRefreshScheduled = true
-        rootFrame.post {
-            uiEinkRefreshScheduled = false
-            runCatching {
-                val decor = window?.decorView ?: rootFrame
-                EpdController.invalidate(decor, mode)
-                EpdController.refreshScreen(decor, mode)
-            }
-        }
-    }
-
     // ─── Tool slots (3 independently-configured pens) ─────────────────────────
 
     private fun setupToolSlots() {
@@ -789,7 +792,11 @@ class MainActivity : AppCompatActivity() {
         toolModalPanel.visibility = View.GONE
         hideToolModalSections()
         updateRawSuppression()
-        penView.forceEinkRefresh()
+        // Not an immediate refresh: closing the modal happens often while configuring tools (tap
+        // a slot, tap it again, pick things, repeat), and refreshing each time added up to its
+        // own kind of flood. Just flag it - the canvas refreshes once, lazily, the moment drawing
+        // actually resumes (see HardwarePenSurfaceView.markUiOverlayDirty).
+        penView.markUiOverlayDirty()
     }
 
     private fun hideToolModalSections() {
@@ -853,12 +860,17 @@ class MainActivity : AppCompatActivity() {
             modalSizeSection.visibility = if (modalSizeSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
         modalColorPickerView.onColorChanged = { color ->
+            // No forced e-ink refresh here on purpose: this fires on every touch-move while
+            // dragging the color wheel, and forcing a hardware refresh per move flashed the
+            // screen dozens of times per drag. Plain view updates (this button, the tool slot
+            // icon tint) are enough to read while the modal's open; the canvas itself only
+            // actually needs a real refresh once drawing resumes, which penView already handles
+            // lazily via markUiOverlayDirty() when this panel closes.
             toolPresets[selectedToolIndex].color = color
             penView.setStrokeColor(color)
             modalColorButton.background = createSwatchDrawable(color, selected = false)
             modalColorHexValue.text = formatHex(color)
             refreshToolSlotVisuals()
-            refreshUiEinkThrottled()
         }
         modalSizeSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
@@ -910,7 +922,6 @@ class MainActivity : AppCompatActivity() {
         penView.setStrokeWidthPx(preset.widthPx)
         refreshModalContents()
         refreshToolSlotVisuals()
-        refreshUiEinkThrottled()
     }
 
     private fun brushIconRes(style: HardwarePenStyle): Int = when (style) {
@@ -1031,7 +1042,7 @@ class MainActivity : AppCompatActivity() {
             positionPopupNearToolbar(layerPanel)
         }
         layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
-        if (willShow) refreshLayerPanel() else penView.forceEinkRefresh()
+        if (willShow) refreshLayerPanel() else penView.markUiOverlayDirty()
         ensureOverlayOrder()
         updateRawSuppression()
     }
@@ -1042,7 +1053,7 @@ class MainActivity : AppCompatActivity() {
             closeToolModal()
             positionPopupNearToolbar(fileMenuPanel)
         } else {
-            penView.forceEinkRefresh()
+            penView.markUiOverlayDirty()
         }
         fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()

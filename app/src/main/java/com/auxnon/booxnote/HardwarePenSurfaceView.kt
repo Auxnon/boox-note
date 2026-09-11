@@ -249,6 +249,21 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         invalidateAndRefreshEpd(UpdateMode.GC)
     }
 
+    /**
+     * Cheap alternative to forceEinkRefresh() for UI that changes often while overlapping the
+     * canvas (panels opening/closing as the user configures things) - just flags that a refresh
+     * is owed, with no hardware call yet. The flag is consumed the moment the next stroke
+     * actually begins (see onBeginRawDrawing), so it costs at most one extra refresh regardless
+     * of how many times panels were shown/hidden first, and guarantees any stale hardware-overlay
+     * pixels are cleared before new ink is drawn over that area rather than after.
+     */
+    @Volatile
+    private var uiOverlayDirty = false
+
+    fun markUiOverlayDirty() {
+        uiOverlayDirty = true
+    }
+
     fun canUndo(): Boolean = undoStack.isNotEmpty()
 
     /** Reverts the most recently committed stroke or erase, on whichever layer it was drawn on. */
@@ -1635,6 +1650,15 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 appendRawMovePoint(mapStrokePoint(pt))
                 Log.d(TAG, "duplicate onBeginRawDrawing style=$activeStyle")
                 return
+            }
+
+            if (uiOverlayDirty) {
+                // A panel opened/closed over the canvas since the last stroke. Clear any stale
+                // hardware-overlay pixels left behind by that now, before the chip starts drawing
+                // fresh ink here - otherwise the new stroke visually draws over the old panel's
+                // leftover pixels instead of replacing them.
+                uiOverlayDirty = false
+                invalidateAndRefreshEpd(UpdateMode.GC)
             }
 
             strokeInProgress = true
