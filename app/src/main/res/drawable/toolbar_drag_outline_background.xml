@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lightweight stand-in shown in place of the full toolbar while it's being dragged: a plain
+     outline is far cheaper to redraw every frame than the real pill's icons/dividers/text, and
+     e-ink partial refreshes struggle to keep up with detailed content moving continuously. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="999dp" />
+    <solid android:color="@android:color/transparent" />
+    <stroke
+        android:width="2dp"
+        android:color="#FF000000" />
+</shape>

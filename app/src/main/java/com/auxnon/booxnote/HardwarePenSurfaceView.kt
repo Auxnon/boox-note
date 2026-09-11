@@ -158,6 +158,10 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     private var receivedAuthorityList = false
     private var pendingPenUpRefresh = false
     private var hasRenderedThisStroke = false
+    // RawInputCallback methods (which set this) and performReconfigureTouchHelper (which now
+    // reads it, to avoid resetting the chip mid-stroke) don't reliably run on the same thread -
+    // postInvalidate() (not invalidate()) was already needed elsewhere for the same reason.
+    @Volatile
     private var strokeInProgress = false
     private var strokeIsErase = false
     private var strokeViewScale = 1f
@@ -228,6 +232,21 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     fun setOnTwoFingerTapListener(listener: (() -> Unit)?) {
         twoFingerTapListener = listener
+    }
+
+    /**
+     * Forces the canvas to repaint from its real backing layer bitmaps and pushes an explicit
+     * e-ink refresh, scoped to this view. For use by the Activity after dismissing UI that
+     * overlapped the canvas (an outside tap closing a panel, etc.) - a generic decor-level EPD
+     * refresh doesn't reliably reach the raw hardware ink overlay this view drives (it's a
+     * separate compositing path, below the normal view hierarchy - the same reason plain
+     * invalidate()/postInvalidate() isn't enough on its own elsewhere in this class), so stale
+     * hardware-drawn pixels from that overlay can visually linger - and then get drawn over
+     * rather than replaced once a new stroke starts nearby. This re-syncs the physical panel to
+     * what's actually stored, clearing any such leftovers.
+     */
+    fun forceEinkRefresh() {
+        invalidateAndRefreshEpd(UpdateMode.GC)
     }
 
     fun canUndo(): Boolean = undoStack.isNotEmpty()
@@ -790,6 +809,18 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         val w = width
         val h = height
         if (w <= 0 || h <= 0) return
+        if (strokeInProgress) {
+            // openRawDrawing() below fully resets the pen chip. Firing that while the user is
+            // mid-stroke (e.g. they changed width/color/brush right before touching down, so the
+            // debounced reconfigure from that change lands after the new stroke has already
+            // begun) corrupts the in-progress raw session: the hardware keeps previewing with
+            // whatever was configured before the reset, and only picks up the real setting once
+            // something else forces a repaint - which is exactly "draws thin, then redraws at the
+            // right size after a full refresh". Defer instead of resetting mid-stroke; this just
+            // re-arms the same debounce, so it fires again the moment the current stroke ends.
+            reconfigureTouchHelper()
+            return
+        }
         val style = activeStyle
         val widthPx = activeWidthPx
         val eraseMode = isEraseModeActive()

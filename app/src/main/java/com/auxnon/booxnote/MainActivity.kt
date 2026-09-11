@@ -27,6 +27,7 @@ import android.text.method.LinkMovementMethod
 import android.text.style.URLSpan
 import android.util.Base64
 import android.util.Log
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -78,6 +79,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var toolbarPill: View
     private lateinit var toolbarHandle: ImageButton
     private lateinit var toolbarContentGroup: View
+    private lateinit var toolbarDragOutline: View
+    private lateinit var toolbarDivider1: View
+    private lateinit var toolbarDivider2: View
+    private lateinit var toolbarDivider3: View
     private lateinit var toolSlotButtons: List<ImageButton>
     private lateinit var zoomValueLabel: TextView
     private lateinit var toolModalPanel: View
@@ -144,6 +149,8 @@ class MainActivity : AppCompatActivity() {
     private var toolbarDragStartViewY = 0f
     private var toolbarDragMaxMovement = 0f
     private var toolbarDragStartTimeMs = 0L
+    private var toolbarDragging = false
+    private var toolbarOrientationVertical = false
     private var uiEinkRefreshScheduled = false
 
     private var pickerInFlight: Boolean = false
@@ -204,6 +211,10 @@ class MainActivity : AppCompatActivity() {
         toolbarPill = findViewById(R.id.toolbarPill)
         toolbarHandle = findViewById(R.id.toolbarHandle)
         toolbarContentGroup = findViewById(R.id.toolbarContentGroup)
+        toolbarDragOutline = findViewById(R.id.toolbarDragOutline)
+        toolbarDivider1 = findViewById(R.id.toolbarDivider1)
+        toolbarDivider2 = findViewById(R.id.toolbarDivider2)
+        toolbarDivider3 = findViewById(R.id.toolbarDivider3)
         penView = findViewById(R.id.penSurfaceView)
         toolSlotButtons = listOf(
             findViewById(R.id.toolSlot0),
@@ -355,10 +366,14 @@ class MainActivity : AppCompatActivity() {
 
     // ─── Floating toolbar: drag, minimize/expand, edge-snap ───────────────────
 
+    /** Where the toolbar settles on release: an outer-edge zone reorients it vertical (it's now
+     *  running along a side), a top/bottom/center zone keeps it horizontal. */
+    private enum class ToolbarSnapZone { TOP_LEFT, TOP, TOP_RIGHT, LEFT, CENTER, RIGHT, BOTTOM_LEFT, BOTTOM, BOTTOM_RIGHT }
+
     private fun setupToolbarPill() {
-        // Collapsed (minimized) size is computed analytically from the handle's own fixed size
-        // plus the pill's padding, rather than by actually hiding content and re-measuring -
-        // avoids any visibility-timing flicker since nothing here depends on runtime content.
+        // Collapsed (minimized) size is the handle's own fixed size plus the pill's padding -
+        // constant regardless of orientation (the handle is a plain square icon), so unlike the
+        // expanded size it never needs re-measuring.
         toolbarPill.post {
             toolbarExpandedWidth = toolbarPill.width
             toolbarExpandedHeight = toolbarPill.height
@@ -376,6 +391,7 @@ class MainActivity : AppCompatActivity() {
                     toolbarDragStartViewY = toolbarPill.y
                     toolbarDragMaxMovement = 0f
                     toolbarDragStartTimeMs = System.currentTimeMillis()
+                    toolbarDragging = false
                     true
                 }
 
@@ -383,22 +399,36 @@ class MainActivity : AppCompatActivity() {
                     val dx = event.rawX - toolbarDragStartRawX
                     val dy = event.rawY - toolbarDragStartRawY
                     toolbarDragMaxMovement = maxOf(toolbarDragMaxMovement, sqrt(dx * dx + dy * dy))
-                    moveToolbarPill(toolbarDragStartViewX + dx, toolbarDragStartViewY + dy)
+                    if (!toolbarDragging && toolbarDragMaxMovement >= dpF(TOOLBAR_TAP_MAX_MOVEMENT_DP)) {
+                        beginToolbarDragOutline()
+                    }
+                    if (toolbarDragging) {
+                        moveToolbarDragOutline(toolbarDragStartViewX + dx, toolbarDragStartViewY + dy)
+                    }
                     true
                 }
 
                 MotionEvent.ACTION_UP -> {
                     endUiTouch(false)
                     val elapsed = System.currentTimeMillis() - toolbarDragStartTimeMs
-                    val wasTap = toolbarDragMaxMovement < dpF(TOOLBAR_TAP_MAX_MOVEMENT_DP) &&
+                    val wasTap = !toolbarDragging &&
+                        toolbarDragMaxMovement < dpF(TOOLBAR_TAP_MAX_MOVEMENT_DP) &&
                         elapsed < TOOLBAR_TAP_MAX_DURATION_MS
-                    if (wasTap) toggleToolbarMinimized() else snapToolbarToNearestEdge()
+                    if (wasTap) {
+                        toggleToolbarMinimized()
+                    } else if (toolbarDragging) {
+                        endToolbarDragOutline()
+                        snapToolbarAfterDrag()
+                    }
                     true
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
                     endUiTouch(true)
-                    snapToolbarToNearestEdge()
+                    if (toolbarDragging) {
+                        endToolbarDragOutline()
+                        snapToolbarAfterDrag()
+                    }
                     true
                 }
 
@@ -407,46 +437,159 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Live 1:1 drag tracking - no animation here, direct manipulation should track the finger
-     *  exactly. Clamped to the current (collapsed or expanded) size so it can't be dragged
-     *  partially off-screen mid-drag. */
-    private fun moveToolbarPill(targetX: Float, targetY: Float) {
+    /**
+     * Swaps in a plain outline in place of the real toolbar for the rest of the drag. E-ink
+     * partial refreshes struggle to keep up with detailed content (icons, dividers, text) moving
+     * continuously; a bare outline is far cheaper to redraw every frame. The real pill only
+     * reappears once, at its final position, when the drag ends.
+     */
+    private fun beginToolbarDragOutline() {
+        toolbarDragging = true
+        val lp = toolbarDragOutline.layoutParams
+        lp.width = toolbarPill.width
+        lp.height = toolbarPill.height
+        toolbarDragOutline.layoutParams = lp
+        toolbarDragOutline.x = toolbarPill.x
+        toolbarDragOutline.y = toolbarPill.y
+        toolbarDragOutline.visibility = View.VISIBLE
+        toolbarPill.visibility = View.INVISIBLE
+    }
+
+    /** Live 1:1 tracking of the lightweight outline - no animation, direct manipulation should
+     *  track the finger exactly. Clamped so it can't be dragged partially off-screen. */
+    private fun moveToolbarDragOutline(targetX: Float, targetY: Float) {
         val parentW = rootFrame.width
         val parentH = rootFrame.height
         if (parentW <= 0 || parentH <= 0) return
-        val maxX = (parentW - toolbarPill.width).coerceAtLeast(0)
-        val maxY = (parentH - toolbarPill.height).coerceAtLeast(0)
-        toolbarPill.x = targetX.coerceIn(0f, maxX.toFloat())
-        toolbarPill.y = targetY.coerceIn(0f, maxY.toFloat())
+        val maxX = (parentW - toolbarDragOutline.width).coerceAtLeast(0)
+        val maxY = (parentH - toolbarDragOutline.height).coerceAtLeast(0)
+        toolbarDragOutline.x = targetX.coerceIn(0f, maxX.toFloat())
+        toolbarDragOutline.y = targetY.coerceIn(0f, maxY.toFloat())
     }
 
-    /** Animates to whichever of the 4 screen edges is nearest the toolbar's current center,
-     *  flush against it (minus a small margin), clamping the other axis to stay on-screen. */
-    private fun snapToolbarToNearestEdge() {
+    private fun endToolbarDragOutline() {
+        toolbarDragging = false
+        toolbarPill.x = toolbarDragOutline.x
+        toolbarPill.y = toolbarDragOutline.y
+        toolbarDragOutline.visibility = View.GONE
+        toolbarPill.visibility = View.VISIBLE
+    }
+
+    /** 3x3 screen split by thirds, classified from the toolbar's center - a standard "snap to
+     *  region" scheme (window snapping, etc.), and simpler/more predictable than measuring exact
+     *  distance to 9 discrete anchor points. */
+    private fun classifyToolbarSnapZone(centerX: Float, centerY: Float, parentW: Float, parentH: Float): ToolbarSnapZone {
+        val col = when {
+            centerX < parentW / 3f -> 0
+            centerX > parentW * 2f / 3f -> 2
+            else -> 1
+        }
+        val row = when {
+            centerY < parentH / 3f -> 0
+            centerY > parentH * 2f / 3f -> 2
+            else -> 1
+        }
+        return when (row) {
+            0 -> when (col) { 0 -> ToolbarSnapZone.TOP_LEFT; 2 -> ToolbarSnapZone.TOP_RIGHT; else -> ToolbarSnapZone.TOP }
+            2 -> when (col) { 0 -> ToolbarSnapZone.BOTTOM_LEFT; 2 -> ToolbarSnapZone.BOTTOM_RIGHT; else -> ToolbarSnapZone.BOTTOM }
+            else -> when (col) { 0 -> ToolbarSnapZone.LEFT; 2 -> ToolbarSnapZone.RIGHT; else -> ToolbarSnapZone.CENTER }
+        }
+    }
+
+    /**
+     * Classifies where the toolbar was released into one of 9 zones, reorients it
+     * vertical/horizontal to match (a side zone runs vertical, top/bottom/center stays
+     * horizontal), and animates it flush against that zone's edge(s) - or centered, for CENTER.
+     */
+    private fun snapToolbarAfterDrag() {
         val parentW = rootFrame.width.toFloat()
         val parentH = rootFrame.height.toFloat()
         if (parentW <= 0f || parentH <= 0f) return
-        val w = toolbarPill.width.toFloat()
-        val h = toolbarPill.height.toFloat()
-        val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
-        val centerX = toolbarPill.x + w / 2f
-        val centerY = toolbarPill.y + h / 2f
+        val centerX = toolbarPill.x + toolbarPill.width / 2f
+        val centerY = toolbarPill.y + toolbarPill.height / 2f
+        val zone = classifyToolbarSnapZone(centerX, centerY, parentW, parentH)
+        val wantsVertical = zone == ToolbarSnapZone.LEFT || zone == ToolbarSnapZone.RIGHT ||
+            zone == ToolbarSnapZone.TOP_LEFT || zone == ToolbarSnapZone.TOP_RIGHT ||
+            zone == ToolbarSnapZone.BOTTOM_LEFT || zone == ToolbarSnapZone.BOTTOM_RIGHT
+        if (wantsVertical != toolbarOrientationVertical) applyToolbarOrientation(wantsVertical)
 
-        val distLeft = centerX
-        val distRight = parentW - centerX
-        val distTop = centerY
-        val distBottom = parentH - centerY
-        val minDist = minOf(distLeft, distRight, distTop, distBottom)
-
-        var targetX = toolbarPill.x.coerceIn(0f, (parentW - w).coerceAtLeast(0f))
-        var targetY = toolbarPill.y.coerceIn(0f, (parentH - h).coerceAtLeast(0f))
-        when (minDist) {
-            distLeft -> targetX = margin
-            distRight -> targetX = (parentW - w - margin).coerceAtLeast(margin)
-            distTop -> targetY = margin
-            else -> targetY = (parentH - h - margin).coerceAtLeast(margin)
+        // Re-measure fresh: width/height swap when the stacking direction flips, so any cached
+        // size from before is potentially stale the moment orientation changes.
+        toolbarPill.measure(
+            View.MeasureSpec.makeMeasureSpec(rootFrame.width, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(rootFrame.height, View.MeasureSpec.AT_MOST)
+        )
+        val w = toolbarPill.measuredWidth
+        val h = toolbarPill.measuredHeight
+        if (toolbarMinimized) {
+            toolbarCollapsedWidth = w
+            toolbarCollapsedHeight = h
+        } else {
+            toolbarExpandedWidth = w
+            toolbarExpandedHeight = h
         }
+
+        val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
+        var targetX = centerX - w / 2f
+        var targetY = centerY - h / 2f
+        when (zone) {
+            ToolbarSnapZone.LEFT, ToolbarSnapZone.TOP_LEFT, ToolbarSnapZone.BOTTOM_LEFT -> targetX = margin
+            ToolbarSnapZone.RIGHT, ToolbarSnapZone.TOP_RIGHT, ToolbarSnapZone.BOTTOM_RIGHT -> targetX = parentW - w - margin
+            ToolbarSnapZone.TOP, ToolbarSnapZone.BOTTOM, ToolbarSnapZone.CENTER -> targetX = (parentW - w) / 2f
+        }
+        when (zone) {
+            ToolbarSnapZone.TOP_LEFT, ToolbarSnapZone.TOP, ToolbarSnapZone.TOP_RIGHT -> targetY = margin
+            ToolbarSnapZone.BOTTOM_LEFT, ToolbarSnapZone.BOTTOM, ToolbarSnapZone.BOTTOM_RIGHT -> targetY = parentH - h - margin
+            ToolbarSnapZone.LEFT, ToolbarSnapZone.RIGHT, ToolbarSnapZone.CENTER -> targetY = (parentH - h) / 2f
+        }
+        targetX = targetX.coerceIn(margin, (parentW - w - margin).coerceAtLeast(margin))
+        targetY = targetY.coerceIn(margin, (parentH - h - margin).coerceAtLeast(margin))
+
+        val lp = toolbarPill.layoutParams
+        lp.width = w
+        lp.height = h
+        toolbarPill.layoutParams = lp
         toolbarPill.animate().x(targetX).y(targetY).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+    }
+
+    /**
+     * Re-flows the pill from a horizontal row to a vertical column (or back): toolSlotsGroup and
+     * topButtonsGroup deliberately stay horizontal internally (small 2-3-button clusters), so a
+     * vertical toolbar is a narrow stack of horizontal mini-rows rather than one long single-file
+     * column of every button - keeps it dock-width-appropriate for a side edge.
+     */
+    private fun applyToolbarOrientation(vertical: Boolean) {
+        if (toolbarOrientationVertical == vertical) return
+        toolbarOrientationVertical = vertical
+        val orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        val gravity = if (vertical) Gravity.CENTER_HORIZONTAL else Gravity.CENTER_VERTICAL
+        val pill = toolbarPill as LinearLayout
+        pill.orientation = orientation
+        pill.gravity = gravity
+        val contentGroup = toolbarContentGroup as LinearLayout
+        contentGroup.orientation = orientation
+        contentGroup.gravity = gravity
+
+        // Handle-to-content gap: marginStart when horizontal, marginTop when stacked vertically.
+        val contentLp = toolbarContentGroup.layoutParams as LinearLayout.LayoutParams
+        val gap = contentLp.marginStart + contentLp.topMargin
+        contentLp.marginStart = if (vertical) 0 else gap
+        contentLp.topMargin = if (vertical) gap else 0
+        toolbarContentGroup.layoutParams = contentLp
+
+        listOf(toolbarDivider1, toolbarDivider2, toolbarDivider3).forEach { divider ->
+            val lp = divider.layoutParams as LinearLayout.LayoutParams
+            val w = lp.width
+            lp.width = lp.height
+            lp.height = w
+            val startMargin = lp.marginStart
+            val endMargin = lp.marginEnd
+            lp.marginStart = lp.topMargin
+            lp.marginEnd = lp.bottomMargin
+            lp.topMargin = startMargin
+            lp.bottomMargin = endMargin
+            divider.layoutParams = lp
+        }
     }
 
     private fun toggleToolbarMinimized() {
@@ -466,15 +609,25 @@ class MainActivity : AppCompatActivity() {
 
     /** Reveals content BEFORE the size grows (so it fades in as the pill widens, rather than
      *  popping in once fully expanded), and proactively slides the pill so the full expanded
-     *  bounds stay on-screen throughout the animation instead of only clamping at the end. */
+     *  bounds stay on-screen throughout the animation instead of only clamping at the end.
+     *  Re-measures fresh rather than trusting the cached expanded size, which may be stale for
+     *  the current orientation if the toolbar was dragged to a different edge while minimized. */
     private fun expandToolbar() {
         if (!toolbarMinimized) return
         toolbarMinimized = false
-        repositionForSize(toolbarExpandedWidth, toolbarExpandedHeight)
         toolbarContentGroup.visibility = View.VISIBLE
         toolbarContentGroup.alpha = 0f
+        toolbarPill.measure(
+            View.MeasureSpec.makeMeasureSpec(rootFrame.width, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(rootFrame.height, View.MeasureSpec.AT_MOST)
+        )
+        val expandedW = toolbarPill.measuredWidth
+        val expandedH = toolbarPill.measuredHeight
+        toolbarExpandedWidth = expandedW
+        toolbarExpandedHeight = expandedH
+        repositionForSize(expandedW, expandedH)
         toolbarContentGroup.animate().alpha(1f).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
-        animatePillSize(toolbarPill.width, toolbarPill.height, toolbarExpandedWidth, toolbarExpandedHeight) {}
+        animatePillSize(toolbarPill.width, toolbarPill.height, expandedW, expandedH) {}
     }
 
     /** Slides the pill (animated) so a box of [targetW]x[targetH] anchored at its current
@@ -636,6 +789,7 @@ class MainActivity : AppCompatActivity() {
         toolModalPanel.visibility = View.GONE
         hideToolModalSections()
         updateRawSuppression()
+        penView.forceEinkRefresh()
     }
 
     private fun hideToolModalSections() {
@@ -877,7 +1031,7 @@ class MainActivity : AppCompatActivity() {
             positionPopupNearToolbar(layerPanel)
         }
         layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
-        if (willShow) refreshLayerPanel()
+        if (willShow) refreshLayerPanel() else penView.forceEinkRefresh()
         ensureOverlayOrder()
         updateRawSuppression()
     }
@@ -887,6 +1041,8 @@ class MainActivity : AppCompatActivity() {
         if (willShow) {
             closeToolModal()
             positionPopupNearToolbar(fileMenuPanel)
+        } else {
+            penView.forceEinkRefresh()
         }
         fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()
@@ -1562,6 +1718,11 @@ class MainActivity : AppCompatActivity() {
             // physical panel doesn't repaint until an actual EpdController refresh is issued (same
             // class of bug as the earlier brush-switch blanking). Without this, a dismissed panel
             // (e.g. the color picker) leaves its stale pixels sitting on screen indefinitely.
+            // penView also gets its own dedicated refresh: a generic decor-level one doesn't
+            // reliably reach the raw hardware ink overlay it drives (a separate compositing path
+            // below the normal view hierarchy), which otherwise leaves stale hardware-drawn pixels
+            // that a new stroke then draws over instead of replacing.
+            penView.forceEinkRefresh()
             rootFrame.post {
                 runCatching {
                     val decor = window?.decorView ?: rootFrame
