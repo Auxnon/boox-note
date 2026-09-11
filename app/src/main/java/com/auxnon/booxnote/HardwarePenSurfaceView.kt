@@ -878,26 +878,17 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             // own raw-preview overlay was showing. The actual drawing (our layer bitmaps) was
             // never touched, but on e-ink a plain postInvalidate() only redraws the Android-level
             // canvas into memory - the physical panel doesn't repaint until an actual
-            // EpdController refresh is issued, so that alone left the panel showing nothing until
-            // the next stroke's pen-up refresh. Only do the real hardware refresh when the
-            // configured style actually changed (a real brush/eraser switch), not on every
-            // reconfigure - width/color tweaks (e.g. dragging the width slider) reconfigure once
-            // per debounce tick and forcing a hardware refresh there would reintroduce flicker.
+            // EpdController refresh is issued. This used to fire that refresh immediately (twice,
+            // as a timing safety net) whenever the style changed, but with tool presets driving
+            // brush selection now, that fires on every tool/brush pick made through the modal -
+            // one or two hardware refreshes per pick added up to its own flood. Same fix as the
+            // panel-close case: just flag it dirty and let onBeginRawDrawing's lazy check do the
+            // one real refresh that actually matters, right before the next stroke.
             if (lastConfiguredHardwareStyle != hardwareStyle) {
                 lastConfiguredHardwareStyle = hardwareStyle
-                val mode = commitUpdateModeFor(hardwareStyle)
-                post {
-                    invalidateAndRefreshEpd(mode)
-                    // e-ink refreshes are asynchronous at the hardware level, and openRawDrawing()
-                    // resetting the chip may clear its drawing region on its own delayed timeline -
-                    // if that clear lands after our refresh above already completed, it visually
-                    // stomps it a moment later. Repeat the refresh once more shortly after as a
-                    // safety net, same pattern as the existing pen-up fallback refresh.
-                    postDelayed({ invalidateAndRefreshEpd(mode) }, 180L)
-                }
-            } else {
-                postInvalidate()
+                uiOverlayDirty = true
             }
+            postInvalidate()
         }
     }
 

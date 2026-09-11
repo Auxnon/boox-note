@@ -141,6 +141,8 @@ class MainActivity : AppCompatActivity() {
     private var toolbarMinimized = false
     private var toolbarExpandedWidth = 0
     private var toolbarExpandedHeight = 0
+    private var toolbarExpandedWidthVertical = 0
+    private var toolbarExpandedHeightVertical = 0
     private var toolbarCollapsedWidth = 0
     private var toolbarCollapsedHeight = 0
     private var toolbarDragStartRawX = 0f
@@ -150,6 +152,7 @@ class MainActivity : AppCompatActivity() {
     private var toolbarDragMaxMovement = 0f
     private var toolbarDragStartTimeMs = 0L
     private var toolbarDragging = false
+    private var toolbarDragPreviewVertical = false
     private var toolbarOrientationVertical = false
 
     private var pickerInFlight: Boolean = false
@@ -378,6 +381,7 @@ class MainActivity : AppCompatActivity() {
             toolbarExpandedHeight = toolbarPill.height
             toolbarCollapsedWidth = toolbarHandle.width + toolbarPill.paddingStart + toolbarPill.paddingEnd
             toolbarCollapsedHeight = toolbarHandle.height + toolbarPill.paddingTop + toolbarPill.paddingBottom
+            cacheVerticalExpandedSize()
         }
 
         toolbarHandle.setOnTouchListener { _, event ->
@@ -437,6 +441,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * One-time measurement of what the expanded size would be in the OTHER orientation, so the
+     * drag outline can preview a reorientation live without needing to actually touch (or make
+     * visible) the real toolbar mid-drag. Toggles orientation, measures, and toggles back
+     * synchronously - since nothing yields to the next frame in between, this is never rendered.
+     * Only valid while expanded (content visible) at call time, which is the case right after
+     * initial layout, so this only needs to run once.
+     */
+    private fun cacheVerticalExpandedSize() {
+        if (toolbarMinimized) return
+        val wasVertical = toolbarOrientationVertical
+        applyToolbarOrientation(!wasVertical)
+        toolbarPill.measure(
+            View.MeasureSpec.makeMeasureSpec(rootFrame.width, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(rootFrame.height, View.MeasureSpec.AT_MOST)
+        )
+        if (!wasVertical) {
+            toolbarExpandedWidthVertical = toolbarPill.measuredWidth
+            toolbarExpandedHeightVertical = toolbarPill.measuredHeight
+        } else {
+            toolbarExpandedWidth = toolbarPill.measuredWidth
+            toolbarExpandedHeight = toolbarPill.measuredHeight
+        }
+        applyToolbarOrientation(wasVertical)
+    }
+
+    /**
      * Swaps in a plain outline in place of the real toolbar for the rest of the drag. E-ink
      * partial refreshes struggle to keep up with detailed content (icons, dividers, text) moving
      * continuously; a bare outline is far cheaper to redraw every frame. The real pill only
@@ -444,6 +474,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun beginToolbarDragOutline() {
         toolbarDragging = true
+        toolbarDragPreviewVertical = toolbarOrientationVertical
         val lp = toolbarDragOutline.layoutParams
         lp.width = toolbarPill.width
         lp.height = toolbarPill.height
@@ -454,20 +485,66 @@ class MainActivity : AppCompatActivity() {
         toolbarPill.visibility = View.INVISIBLE
     }
 
-    /** Live 1:1 tracking of the lightweight outline - no animation, direct manipulation should
-     *  track the finger exactly. Clamped so it can't be dragged partially off-screen. */
+    /**
+     * Live 1:1 tracking of the lightweight outline - no animation, direct manipulation should
+     * track the finger exactly. Also previews which orientation the current position would snap
+     * to (same classification snapToolbarAfterDrag uses at release), reshaping the outline
+     * on the fly so the user can see what they'll get before letting go. Skipped while minimized:
+     * the collapsed size is a square regardless of orientation, so there's nothing to preview.
+     */
     private fun moveToolbarDragOutline(targetX: Float, targetY: Float) {
         val parentW = rootFrame.width
         val parentH = rootFrame.height
         if (parentW <= 0 || parentH <= 0) return
+
+        var x = targetX
+        var y = targetY
+        if (!toolbarMinimized && toolbarExpandedWidthVertical > 0 && toolbarExpandedHeightVertical > 0) {
+            val margin = dpF(TOOLBAR_EDGE_MARGIN_DP)
+            val curW = toolbarDragOutline.width.toFloat()
+            val curH = toolbarDragOutline.height.toFloat()
+            val minX = margin
+            val maxX = (parentW - curW - margin).coerceAtLeast(minX)
+            val fracX = if (maxX > minX) ((targetX - minX) / (maxX - minX)).coerceIn(0f, 1f) else 0.5f
+            val minY = margin
+            val maxY = (parentH - curH - margin).coerceAtLeast(minY)
+            val fracY = if (maxY > minY) ((targetY - minY) / (maxY - minY)).coerceIn(0f, 1f) else 0.5f
+            val zone = classifyToolbarSnapZone(fracX, fracY)
+            val wantsVertical = zone == ToolbarSnapZone.LEFT || zone == ToolbarSnapZone.RIGHT ||
+                zone == ToolbarSnapZone.TOP_LEFT || zone == ToolbarSnapZone.TOP_RIGHT ||
+                zone == ToolbarSnapZone.BOTTOM_LEFT || zone == ToolbarSnapZone.BOTTOM_RIGHT
+
+            if (wantsVertical != toolbarDragPreviewVertical) {
+                toolbarDragPreviewVertical = wantsVertical
+                val newW = if (wantsVertical) toolbarExpandedWidthVertical else toolbarExpandedWidth
+                val newH = if (wantsVertical) toolbarExpandedHeightVertical else toolbarExpandedHeight
+                // Keep it centered on the same point rather than jumping by the top-left corner.
+                val centerX = targetX + curW / 2f
+                val centerY = targetY + curH / 2f
+                x = centerX - newW / 2f
+                y = centerY - newH / 2f
+                val lp = toolbarDragOutline.layoutParams
+                lp.width = newW
+                lp.height = newH
+                toolbarDragOutline.layoutParams = lp
+            }
+        }
+
         val maxX = (parentW - toolbarDragOutline.width).coerceAtLeast(0)
         val maxY = (parentH - toolbarDragOutline.height).coerceAtLeast(0)
-        toolbarDragOutline.x = targetX.coerceIn(0f, maxX.toFloat())
-        toolbarDragOutline.y = targetY.coerceIn(0f, maxY.toFloat())
+        toolbarDragOutline.x = x.coerceIn(0f, maxX.toFloat())
+        toolbarDragOutline.y = y.coerceIn(0f, maxY.toFloat())
     }
 
     private fun endToolbarDragOutline() {
         toolbarDragging = false
+        // Transfer the outline's final size too, not just position: snapToolbarAfterDrag's own
+        // zone classification uses toolbarPill's width/height, and needs to agree with whatever
+        // shape the outline was just previewing so the release doesn't second-guess it.
+        val lp = toolbarPill.layoutParams
+        lp.width = toolbarDragOutline.width
+        lp.height = toolbarDragOutline.height
+        toolbarPill.layoutParams = lp
         toolbarPill.x = toolbarDragOutline.x
         toolbarPill.y = toolbarDragOutline.y
         toolbarDragOutline.visibility = View.GONE
@@ -792,11 +869,10 @@ class MainActivity : AppCompatActivity() {
         toolModalPanel.visibility = View.GONE
         hideToolModalSections()
         updateRawSuppression()
-        // Not an immediate refresh: closing the modal happens often while configuring tools (tap
-        // a slot, tap it again, pick things, repeat), and refreshing each time added up to its
-        // own kind of flood. Just flag it - the canvas refreshes once, lazily, the moment drawing
-        // actually resumes (see HardwarePenSurfaceView.markUiOverlayDirty).
-        penView.markUiOverlayDirty()
+        // Immediate, not the lazy markUiOverlayDirty() - this only fires once per close (picking
+        // things inside the modal doesn't call this), so it isn't the flood source; the flood was
+        // the per-pick hardware-style-change refresh in HardwarePenSurfaceView, fixed separately.
+        penView.forceEinkRefresh()
     }
 
     private fun hideToolModalSections() {
@@ -857,7 +933,14 @@ class MainActivity : AppCompatActivity() {
         }
         modalSizeButton.setOnClickListener {
             modalColorSection.visibility = View.GONE
-            modalSizeSection.visibility = if (modalSizeSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            val opening = modalSizeSection.visibility != View.VISIBLE
+            modalSizeSection.visibility = if (opening) View.VISIBLE else View.GONE
+            if (opening) {
+                // A SeekBar that was GONE (never measured/laid out) doesn't reliably paint its
+                // progressDrawable the first time it becomes visible - it only showed up once
+                // touched, which forces the same internal redraw this does directly.
+                modalSizeSeekBar.jumpDrawablesToCurrentState()
+            }
         }
         modalColorPickerView.onColorChanged = { color ->
             // No forced e-ink refresh here on purpose: this fires on every touch-move while
@@ -1042,7 +1125,7 @@ class MainActivity : AppCompatActivity() {
             positionPopupNearToolbar(layerPanel)
         }
         layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
-        if (willShow) refreshLayerPanel() else penView.markUiOverlayDirty()
+        if (willShow) refreshLayerPanel() else penView.forceEinkRefresh()
         ensureOverlayOrder()
         updateRawSuppression()
     }
@@ -1053,7 +1136,7 @@ class MainActivity : AppCompatActivity() {
             closeToolModal()
             positionPopupNearToolbar(fileMenuPanel)
         } else {
-            penView.markUiOverlayDirty()
+            penView.forceEinkRefresh()
         }
         fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()
