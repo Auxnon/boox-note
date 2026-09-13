@@ -497,7 +497,7 @@
             android:paddingTop="12dp"
             android:paddingEnd="10dp"
             android:paddingBottom="12dp"
-            android:text="Live preview: off"
+            android:text="Pencil: plain"
             android:textColor="@drawable/menu_item_text_color"
             android:textSize="15sp" />
 

@@ -36,8 +36,8 @@ android {
         applicationId = "com.auxnon.booxnote"
         minSdk = 26
         targetSdk = 34
-        versionCode = 38
-        versionName = "0.0.38"
+        versionCode = 40
+        versionName = "0.0.40"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

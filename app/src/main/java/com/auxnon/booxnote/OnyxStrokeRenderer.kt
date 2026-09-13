@@ -318,9 +318,8 @@ object OnyxStrokeRenderer {
         val src = Rect(0, 0, mask.width, mask.height)
         val dst = RectF()
         val baseRadius = max(0.6f, widthPx * 0.5f)
-        // Spacing follows the stamp, so speed changes density rather than darkness.
-        val step = max(0.6f, baseRadius * 0.22f)
         var carry = 0f
+        var grainSeed = 0x9E3779B9.toInt()
         // Reports the tilt range this stroke actually spanned, so PENCIL_TILT_MIN/MAX can be
         // calibrated from measurements instead of estimates - the previous range was guessed and
         // was the reason altitude appeared to do nothing.
@@ -375,13 +374,24 @@ object OnyxStrokeRenderer {
                 val coverage = (0.55f + press * 0.4f) * (1f - altitude * 0.5f)
                 paint.alpha = (255f * coverage).toInt().coerceIn(6, 255)
 
+                // Rotate the mask slightly differently each time. Stamped at a fixed angle the
+                // texture lines up with itself stamp after stamp and the grain cancels out into
+                // flat tone - the jitter is what keeps it reading as graphite on paper.
+                grainSeed = grainSeed * 1664525 + 1013904223
+                val jitter = (((grainSeed ushr 8) and 0xFF) / 255f - 0.5f) * 18f
+
                 canvas.save()
                 canvas.translate(x, y)
-                canvas.rotate(Math.toDegrees(azimuth.toDouble()).toFloat())
+                canvas.rotate(Math.toDegrees(azimuth.toDouble()).toFloat() + jitter)
                 dst.set(-along, -across, along, across)
                 canvas.drawBitmap(mask, src, dst, paint)
                 canvas.restore()
-                t += step
+
+                // Advance by the stamp's own size, not the brush radius. Fixed spacing meant a
+                // leaned pencil - whose stamp grows several times larger - laid its stamps almost
+                // on top of one another, and that overlap averaged the grain away into smooth
+                // tone. Spacing that tracks the stamp keeps texture density constant at any lean.
+                t += max(0.8f, across * 0.55f)
             }
             carry = t - segLen
         }

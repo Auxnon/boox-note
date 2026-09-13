@@ -961,6 +961,19 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     // TouchHelper management
 
+    /**
+     * Which brush we rasterise with at pen-up. Kept deliberately in step with
+     * previewStrokeStyleFor(): previewing charcoal while baking a stamped pencil just moved the
+     * mismatch rather than fixing it - the point of the swap is that one engine draws both halves,
+     * so what appears under the pen is what stays there.
+     */
+    private fun bakeStyleFor(style: HardwarePenStyle): HardwarePenStyle =
+        if (texturedPencilPreview && style == HardwarePenStyle.PENCIL) {
+            HardwarePenStyle.CHARCOAL
+        } else {
+            style
+        }
+
     /** Which brush the chip previews with - not necessarily the one we bake with. */
     private fun previewStrokeStyleFor(style: HardwarePenStyle): Int =
         if (texturedPencilPreview && style == HardwarePenStyle.PENCIL) {
@@ -1166,9 +1179,9 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         val beforeBitmap = runCatching { layer.bitmap.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
         runCatching {
             if (strokeIsErase) {
-                OnyxStrokeRenderer.erase(strokeStyle, copy, strokeWidthPx, layer.canvas, pressureCeiling)
+                OnyxStrokeRenderer.erase(bakeStyleFor(strokeStyle), copy, strokeWidthPx, layer.canvas, pressureCeiling)
             } else {
-                OnyxStrokeRenderer.render(strokeStyle, copy, strokeWidthPx, strokeColor, layer.canvas, pressureCeiling)
+                OnyxStrokeRenderer.render(bakeStyleFor(strokeStyle), copy, strokeWidthPx, strokeColor, layer.canvas, pressureCeiling)
             }
         }.onFailure { e ->
             Log.e(TAG, "render threw: ${e.javaClass.simpleName}: ${e.message}", e)

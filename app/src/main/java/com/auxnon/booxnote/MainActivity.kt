@@ -2046,13 +2046,17 @@ class MainActivity : AppCompatActivity() {
      * Switches between the pen chip drawing the live stroke and us drawing it.
      *
      * Drawing the preview ourselves turned out to be impossible - the only feature flag that
-     * delivers pen input on this device is the one where the chip draws - so the lever we do have
-     * is which brush it previews with. Charcoal previews with texture, much closer to the pencil's
-     * grainy bake than the chip's flat pencil dabs, at the cost of not being literally a pencil.
+     * delivers pen input on this device is the one where the chip draws - so the lever we have is
+     * which brush it previews with, and the chip's textured brush is charcoal.
+     *
+     * When on, the pencil tool uses the charcoal engine for BOTH the preview and the bake. That is
+     * the whole point: one engine drawing both halves means what appears under the pen is what
+     * stays there, instead of a textured preview being replaced by a differently-textured bake.
+     * The cost is that the tool is charcoal-flavoured rather than literally a pencil.
      */
     private fun setLivePreview(enabled: Boolean) {
         penView.setTexturedPencilPreview(enabled)
-        livePreviewBtn.text = if (enabled) "Textured preview: on" else "Textured preview: off"
+        livePreviewBtn.text = if (enabled) "Pencil: textured" else "Pencil: plain"
         prefs().edit().putBoolean(KEY_LIVE_PREVIEW, enabled).apply()
     }
 
