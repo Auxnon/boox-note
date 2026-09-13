@@ -36,9 +36,13 @@ android {
         applicationId = "com.auxnon.booxnote"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.0.1"
+        versionCode = 38
+        versionName = "0.0.38"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
@@ -84,6 +88,20 @@ dependencies {
     implementation(files("libs/onyxsdk-base-1.8.4.aar"))
     implementation(files("libs/onyxsdk-pen-1.5.2.aar"))
     implementation(files("libs/onyxsdk-device-1.3.3.aar"))
+    // Supplies com.onyx.android.sdk.base.lite.* (PathKt, CollectionKt, BitmapKt, RectFKt,
+    // MathUtils). The pen AAR and the native pen engines are compiled against that package, while
+    // onyxsdk-base only carries those helpers under the older com.onyx.android.sdk.* names - so
+    // nothing provided them and NeoPencilPen/PencilNeoPenRender died on NoClassDefFoundError the
+    // moment they were called. Their callers caught it and fell back to a plain polyline, which is
+    // why "pencil" drew as a featureless round brush with no grain or tilt.
+    //
+    // Pulled from Onyx's own Maven repo (already configured in settings.gradle.kts) - the SDK is
+    // not on Maven Central. Note the sibling artifact onyxsdk-penbrush is deliberately NOT used:
+    // it republishes the whole Neo pen engine, colliding with onyxsdk-pen-native-classes.jar, and
+    // references NeoPenNative without shipping it. Its one genuinely missing piece, the pencil
+    // brush texture, is vendored instead (res/drawable/onyx_pencil_brush.png + the R shim in
+    // com/onyx/android/sdk/penbrush/R.java).
+    implementation("com.onyx.android.sdk:onyxsdk-baselite:1.1.1.3")
     // Native pen engine classes extracted from device knote2 APK (classes7.dex)
     // Provides NeoPenConfig, NeoPenUtils, NeoMarkerPen, NeoPenNative etc. which are
     // missing from the stub onyxsdk-pen-1.5.2.aar but required at runtime by the wrappers.

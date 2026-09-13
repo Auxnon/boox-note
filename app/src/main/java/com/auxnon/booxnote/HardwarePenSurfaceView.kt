@@ -23,6 +23,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -30,7 +31,7 @@ import kotlin.math.sqrt
  * Full-screen drawing surface backed by the Onyx hardware pen chip.
  *
  * Architecture:
- *  - TouchHelper drives zero-latency hardware preview (setRawDrawingRenderEnabled=false).
+ *  - TouchHelper drives zero-latency hardware preview (setRawDrawingRenderEnabled=true).
  *  - RawInputCallback accumulates points and renders to the active software layer.
  *  - On pen-up / onPenUpRefresh the hardware preview clears and composed layers are shown.
  */
@@ -45,6 +46,19 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         private const val UNDO_STACK_MAX = 15
         private const val TWO_FINGER_TAP_MAX_DURATION_MS = 300L
         private const val TWO_FINGER_TAP_MAX_MOVEMENT_DP = 24f
+        private const val OVERVIEW_PINCH_EXIT_RATIO = 0.72f
+
+        /** No raw point for this long means the stroke is orphaned (its onEndRawDrawing is never
+         *  coming), not merely long. Comfortably above the gap between points in a slow stroke. */
+        private const val STROKE_STALE_MS = 900L
+
+        /** Time for the pen chip to actually leave/re-enter its raw session around a repaint. */
+        private const val RAW_SESSION_TOGGLE_SETTLE_MS = 32L
+
+        /** Minimum gap between app-rendered preview repaints. Raw points arrive far faster than
+         *  e-ink can repaint, so without this the refreshes queue up and fall behind the pen. */
+        private const val PREVIEW_FRAME_MS = 40L
+
         private const val HOVER_BUTTON_MASK = MotionEvent.BUTTON_PRIMARY or
             MotionEvent.BUTTON_SECONDARY or
             MotionEvent.BUTTON_TERTIARY or
@@ -184,7 +198,6 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     )
     private var touchHelper: TouchHelper? = null
     @Volatile
-    private var lastConfiguredHardwareStyle: HardwarePenStyle? = null
     private var viewportListener: ((Float) -> Unit)? = null
     @Volatile
     private var viewportGestureSuppressRaw = false
@@ -198,6 +211,9 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     private val layerPaint = Paint().apply { isFilterBitmap = true }
 
     private var epdRefreshScheduled = false
+    @Volatile
+    private var lastRawPointAtMs = 0L
+    private var rawExclusionRects: List<Rect> = emptyList()
 
     // Public API
 
@@ -234,35 +250,115 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         twoFingerTapListener = listener
     }
 
+    /** Fires once per pinch gesture when the user keeps pinching inward past the point where
+     *  zoom-out is already maxed out - the same "rubber-band past the limit" gesture apps like
+     *  Notability use to jump from a page to the page overview. */
+    fun setOnOverviewPinchListener(listener: (() -> Unit)?) {
+        overviewPinchListener = listener
+    }
+
+    private var overviewPinchListener: (() -> Unit)? = null
+    private var overviewPinchFired = false
+
     /**
-     * Forces the canvas to repaint from its real backing layer bitmaps and pushes an explicit
-     * e-ink refresh, scoped to this view. For use by the Activity after dismissing UI that
-     * overlapped the canvas (an outside tap closing a panel, etc.) - a generic decor-level EPD
-     * refresh doesn't reliably reach the raw hardware ink overlay this view drives (it's a
-     * separate compositing path, below the normal view hierarchy - the same reason plain
-     * invalidate()/postInvalidate() isn't enough on its own elsewhere in this class), so stale
-     * hardware-drawn pixels from that overlay can visually linger - and then get drawn over
-     * rather than replaced once a new stroke starts nearby. This re-syncs the physical panel to
-     * what's actually stored, clearing any such leftovers.
+     * Reports where a stroke actually started, in screen coordinates (matching MotionEvent
+     * rawX/rawY), so the Activity can dismiss overlays the pen has drawn past.
+     *
+     * This exists because a stylus touch never reaches the Activity's dispatchTouchEvent() while
+     * the raw drawing session is open - the pen chip consumes it directly. (dispatchTouchEvent()
+     * applies no tool-type filter, so if pen touches reached it they would already behave exactly
+     * like finger taps; they don't, which is what proves the pen bypasses it.) It fires on the
+     * stroke itself rather than on hover: hover-based dismissal made panels vanish from nothing
+     * more than a pen passing overhead.
      */
-    fun forceEinkRefresh() {
-        invalidateAndRefreshEpd(UpdateMode.GC)
+    fun setOnStrokeStartListener(listener: ((screenX: Float, screenY: Float) -> Unit)?) {
+        stylusPointerListener = listener
+    }
+
+    private var stylusPointerListener: ((Float, Float) -> Unit)? = null
+
+    fun isStrokeInProgress(): Boolean = strokeInProgress
+
+    /** Fires once per stroke, after the pen-up refresh has been issued. Lets the Activity run
+     *  screen-level e-ink work that has to wait for the pen chip to be done with the display. */
+    fun setOnStrokeFinishedListener(listener: (() -> Unit)?) {
+        strokeFinishedListener = listener
+    }
+
+    private var strokeFinishedListener: (() -> Unit)? = null
+
+    /**
+     * Clears [regionInView] without leaving the pen chip's raw session, for use at the moment a
+     * stroke begins - when a panel dismissed by the pen still has its pixels on the panel and the
+     * stroke is about to be drawn over them. refreshScreenRegion() is swallowed there.
+     */
+    fun handwritingRepaintRegion(regionInView: Rect?) {
+        val rect = regionInView ?: Rect(0, 0, width, height)
+        if (rect.isEmpty) return
+        invalidate()
+        runCatching { EpdController.handwritingRepaint(this, rect) }
+            .onFailure { Log.w(TAG, "handwritingRepaint failed: ${it.javaClass.simpleName}: ${it.message}") }
+        runCatching {
+            EpdController.invalidate(this, rect.left, rect.top, rect.right, rect.bottom, UpdateMode.DU)
+        }.onFailure { Log.w(TAG, "region invalidate failed: ${it.javaClass.simpleName}: ${it.message}") }
     }
 
     /**
-     * Cheap alternative to forceEinkRefresh() for UI that changes often while overlapping the
-     * canvas (panels opening/closing as the user configures things) - just flags that a refresh
-     * is owed, with no hardware call yet. The flag is consumed the moment the next stroke
-     * actually begins (see onBeginRawDrawing), so it costs at most one extra refresh regardless
-     * of how many times panels were shown/hidden first, and guarantees any stale hardware-overlay
-     * pixels are cleared before new ink is drawn over that area rather than after.
+     * Repaints [regionInView] with the raw session switched off around the call. While raw drawing
+     * is enabled the controller owns that area of the panel and swallows ordinary refreshes, which
+     * is why a panel dismissed by drawing kept its pixels. Raw input is restored straight after.
      */
+    fun refreshRegionOutsideRawSession(regionInView: Rect?) {
+        val helper = touchHelper
+        if (helper == null) {
+            invalidateAndRefreshEpd(UpdateMode.GC)
+            return
+        }
+        runOnHelperThread { runCatching { helper.setRawDrawingEnabled(false) } }
+        postDelayed({
+            invalidate()
+            runCatching {
+                EpdController.invalidate(this, UpdateMode.GC)
+                if (regionInView != null) {
+                    EpdController.refreshScreenRegion(
+                        this, regionInView.left, regionInView.top,
+                        regionInView.right, regionInView.bottom, UpdateMode.GC
+                    )
+                } else {
+                    EpdController.refreshScreen(this, UpdateMode.GC)
+                }
+            }
+            postDelayed({
+                runOnHelperThread {
+                    runCatching {
+                        helper.setRawDrawingEnabled(!(rawInputSuppressed || viewportGestureSuppressRaw))
+                    }
+                }
+            }, RAW_SESSION_TOGGLE_SETTLE_MS)
+        }, RAW_SESSION_TOGGLE_SETTLE_MS)
+    }
+
+    /**
+     * Previews the pencil using the chip's charcoal brush instead of its pencil one.
+     *
+     * A genuine app-drawn preview turned out to be unreachable: the only TouchHelper feature flag
+     * that delivers pen input at all on this device is the one where SurfaceFlinger draws the
+     * stroke, and setRawDrawingRenderEnabled(false) does not stop it (this project ran that way for
+     * a long time and still had a preview). So the chip will draw - the only choice is which brush
+     * it draws with, and that need not be the brush we bake with. Charcoal is the one whose
+     * hardware preview has real texture, which is far closer to the grainy pencil bake than the
+     * chip's own flat pencil dabs.
+     */
+    fun setTexturedPencilPreview(enabled: Boolean) {
+        if (texturedPencilPreview == enabled) return
+        texturedPencilPreview = enabled
+        reconfigureTouchHelper()
+    }
+
+    fun isTexturedPencilPreview(): Boolean = texturedPencilPreview
+
     @Volatile
-    private var uiOverlayDirty = false
-
-    fun markUiOverlayDirty() {
-        uiOverlayDirty = true
-    }
+    private var texturedPencilPreview = false
 
     fun canUndo(): Boolean = undoStack.isNotEmpty()
 
@@ -316,6 +412,20 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Arms/disarms erase for the pen's side button, from whatever signal noticed it first.
+     *
+     * Deliberately the same path the eraser tool uses - the tool only ever worked because its mode
+     * flips while the pen is idle, so the chip is reconfigured to the white erase preview before
+     * the pen lands. The side button was instead being noticed in onBeginRawDrawing from the raw
+     * tool type, i.e. after the chip had already been set up to draw ink: too late to preview, and
+     * its reconfigure then landed mid-stroke, got deferred, and fired once the stroke ended - the
+     * stray refresh. Anything that can see the button before contact should call this.
+     */
+    fun setStylusButtonEraserMode(enabled: Boolean) {
+        setSideButtonEraserMode(enabled)
+    }
+
     fun deactivateEraserMode() {
         val before = isEraseModeActive()
         manualEraserMode = false
@@ -344,8 +454,54 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     /**
      * Suppress/restore hardware pen overlay while the user interacts with UI controls.
      */
+    /**
+     * Regions (in this view's coordinates) the pen chip must ignore - normally the bounds of any
+     * floating panel currently covering the canvas.
+     *
+     * This is what lets a panel stay open without switching the pen off wholesale. Blanket
+     * suppression looked equivalent but isn't: a disabled chip delivers no touch-down callback at
+     * all and the pen doesn't reach normal touch dispatch either, so the only pen signal left is
+     * hover - and a pen dropped straight onto the screen can reach contact before any hover sample
+     * arrives, leaving the stroke silently dropped with the panel still up. Excluding the panel's
+     * rect instead keeps the chip live everywhere else, so a stroke starting on the canvas is
+     * reported immediately (and the Activity closes the panel from that), while taps landing on the
+     * panel itself fall through to the normal view hierarchy and work as buttons.
+     */
+    fun setRawExclusionRects(rects: List<Rect>) {
+        if (rects == rawExclusionRects) return
+        rawExclusionRects = rects
+        applyHandwritingRegionExclusions()
+        reconfigureTouchHelper()
+    }
+
+    /**
+     * Hands the panel areas back from the display controller's handwriting region - the
+     * display-side counterpart to the pen exclusions above.
+     *
+     * These are two separate ownerships and we were only ever reclaiming one. TouchHelper's
+     * exclusions stop the *pen* drawing over a panel, but the EPD controller still held those
+     * pixels as part of its handwriting region, which is the likeliest reason every repaint aimed
+     * at a dismissed panel was accepted and then silently did nothing while a stroke was live.
+     */
+    private fun applyHandwritingRegionExclusions() {
+        runCatching {
+            EpdController.setScreenHandWritingRegionExclude(this, rawExclusionRects.toTypedArray())
+        }.onFailure {
+            Log.w(TAG, "handwriting region exclude failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
     fun setRawInputSuppressed(suppressed: Boolean) {
         rawInputSuppressed = suppressed
+        if (suppressed && strokeInProgress) {
+            // Disabling raw drawing mid-stroke means onEndRawDrawing never arrives, so the flag
+            // would stay set forever and performReconfigureTouchHelper() would defer every
+            // reconfigure from then on. Commit what was drawn before letting go of it - simply
+            // clearing the flag threw the stroke away, because onEndRawDrawing returns early
+            // without it and nothing else ever rasterises the points.
+            abandonStrokeKeepingInk("raw input suppressed")
+            reconfigureTouchHelper()
+        }
         val helper = touchHelper ?: return
         runOnHelperThread {
             runCatching { helper.setRawDrawingEnabled(!(suppressed || viewportGestureSuppressRaw)) }
@@ -593,6 +749,25 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         return true
     }
 
+    /** Wipes the document back to a single blank layer - for switching to a brand new canvas. */
+    fun resetToBlankDocument() {
+        clearUndoStack()
+        strokePoints.clear()
+        rawMovePoints.clear()
+        receivedAuthorityList = false
+        pendingPenUpRefresh = false
+        hasRenderedThisStroke = false
+        strokeInProgress = false
+        strokeLayerId = -1
+
+        layers.forEach { recycleLayer(it) }
+        layers.clear()
+        nextLayerId = 1
+        activeLayerId = -1
+        ensureLayerStack(width, height)
+        invalidateAndRefreshEpd(UpdateMode.GC)
+    }
+
     /**
      * Exports the visible composed result of all layers.
      */
@@ -638,8 +813,16 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         logStylusMotionEvent(event, "touch")
         dispatchStylusHoverButtonState(event, "touch")
         if (rawInputSuppressed) {
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                Log.w(TAG, "onTouchEvent DOWN dropped: rawInputSuppressed=true")
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> Log.w(TAG, "onTouchEvent DOWN dropped: rawInputSuppressed=true")
+                // Terminal events still have to release viewport-gesture state, which lives below
+                // this early return in handleViewportGesture(). Suppression can switch on *during*
+                // a gesture - pinching past the zoom-out limit opens the canvas overview, which
+                // suppresses raw input while two fingers are still down - and then this return
+                // swallowed the UP that would have cleared viewportGestureSuppressRaw. It stayed
+                // set forever, so setRawDrawingEnabled(!(suppressed || viewportGestureSuppressRaw))
+                // kept the pen disabled even after the overview closed: drawing dead for good.
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> releaseViewportGesture()
             }
             return false
         }
@@ -778,6 +961,14 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     // TouchHelper management
 
+    /** Which brush the chip previews with - not necessarily the one we bake with. */
+    private fun previewStrokeStyleFor(style: HardwarePenStyle): Int =
+        if (texturedPencilPreview && style == HardwarePenStyle.PENCIL) {
+            HardwarePenStyle.CHARCOAL.hardwareStrokeStyle
+        } else {
+            style.hardwareStrokeStyle
+        }
+
     private fun ensureTouchHelper() {
         if (touchHelper != null) return
         // Feature-flag values decoded via javap -constants on the SDK jar - no official docs for
@@ -813,6 +1004,13 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         postDelayed(reconfigureRunnable, RECONFIGURE_DEBOUNCE_MS)
     }
 
+    /** Skips the debounce, for discrete mode flips that must reach the chip before the pen lands
+     *  (erase on/off). Still declines to reset the chip mid-stroke - that guard lives inside. */
+    private fun reconfigureTouchHelperNow() {
+        removeCallbacks(reconfigureRunnable)
+        performReconfigureTouchHelper()
+    }
+
     private val reconfigureRunnable = Runnable { performReconfigureTouchHelper() }
 
     /**
@@ -824,7 +1022,10 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         val w = width
         val h = height
         if (w <= 0 || h <= 0) return
-        if (strokeInProgress) {
+        // Only a stroke that has gone quiet is treated as orphaned. The previous version gave up
+        // after a fixed number of deferrals, which a genuinely long stroke reached while still
+        // being drawn - and it then dropped that stroke on the floor.
+        if (strokeInProgress && (System.currentTimeMillis() - lastRawPointAtMs) < STROKE_STALE_MS) {
             // openRawDrawing() below fully resets the pen chip. Firing that while the user is
             // mid-stroke (e.g. they changed width/color/brush right before touching down, so the
             // debounced reconfigure from that change lands after the new stroke has already
@@ -836,10 +1037,12 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             reconfigureTouchHelper()
             return
         }
+        abandonStrokeKeepingInk("stroke went stale before reconfigure")
         val style = activeStyle
         val widthPx = activeWidthPx
         val eraseMode = isEraseModeActive()
         val hardwareStyle = if (eraseMode) HardwarePenStyle.PENCIL else style
+        val exclusions = ArrayList(rawExclusionRects)
 
         runOnHelperThread {
             if (touchHelper !== helper) return@runOnHelperThread
@@ -848,6 +1051,14 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 helper.setStrokeWidth(widthPx)
                 helper.enableFingerTouch(false)
                 helper.onlyEnableFingerTouch(false)
+                // Let the firmware own side-button erase. Doing it app-side can't work: the button
+                // isn't reported through buttonState (always 'none') and emits no key events, so
+                // the first sign of it is TOOL_TYPE_ERASER on the touch-down itself - by which
+                // point the chip is already set up to draw ink and can't be reconfigured until the
+                // stroke ends. The firmware sees the button directly and previews the erase itself,
+                // which is the same reason the eraser *tool* looks right: configured before contact.
+                runCatching { helper.enableSideBtnErase(true) }
+                runCatching { helper.setEraserRawDrawingEnabled(true) }
                 // 2. Preview color
                 val hardwareColor = if (eraseMode) {
                     withAlpha(Color.WHITE, 255)
@@ -861,16 +1072,30 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 }
                 helper.setStrokeColor(hardwareColor)
                 // 3. Limits
-                helper.setLimitRect(Rect(0, 0, w, h), emptyList())
+                helper.setLimitRect(Rect(0, 0, w, h), exclusions)
                 // 4. Open (resets chip)
                 helper.openRawDrawing()
                 // 5. Style after open
-                helper.setStrokeStyle(hardwareStyle.hardwareStrokeStyle)
+                helper.setStrokeStyle(previewStrokeStyleFor(hardwareStyle))
                 // Re-apply params after style selection
                 helper.setStrokeWidth(widthPx)
                 helper.setStrokeColor(hardwareColor)
-                // 6. Hardware draws live preview
-                helper.setRawDrawingRenderEnabled(false)
+                // 6. Let the SDK render the live preview with the real brush.
+                //
+                // This was false, which is what makes the pencil preview a row of plain dabs while
+                // the bake shows grain: false leaves the chip drawing a bare stroke rather than the
+                // configured brush. The stock Notes app previews a textured pencil, so the hardware
+                // is capable of it, and OpenInkBridge's Onyx backend sets this true and calls it
+                // "enable hardware E-Ink preview rendering".
+                //
+                // If the old flicker or freeze ever returns, this is the first thing to put back -
+                // but note it is a different knob from the FEATURE_* flags that caused those.
+                helper.setRawDrawingRenderEnabled(true)
+                Log.i(
+                    TAG,
+                    "chip configured: style=$hardwareStyle width=$widthPx renderEnabled=" +
+                        runCatching { helper.isRawDrawingRenderEnabled }.getOrDefault("?")
+                )
                 // 7. Enable unless suppressed by UI
                 helper.setRawDrawingEnabled(!(rawInputSuppressed || viewportGestureSuppressRaw))
             }
@@ -884,15 +1109,86 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             // one or two hardware refreshes per pick added up to its own flood. Same fix as the
             // panel-close case: just flag it dirty and let onBeginRawDrawing's lazy check do the
             // one real refresh that actually matters, right before the next stroke.
-            if (lastConfiguredHardwareStyle != hardwareStyle) {
-                lastConfiguredHardwareStyle = hardwareStyle
-                uiOverlayDirty = true
-            }
             postInvalidate()
         }
     }
 
     // Rendering helpers
+
+    /**
+     * What to treat as "full pressure" when re-rendering a finished stroke.
+     *
+     * The chip previews a stroke at the width it was configured with, but our own re-render feeds
+     * the native pen engine a pressure ceiling to normalise against, and the digitizer advertises
+     * 4096 - a value real strokes never come near (measured peaks run ~1700-2800). Normalising
+     * against it committed every stroke at roughly 60% of the width the preview had just shown:
+     * imperceptible at 5px, glaring at 80px, and only noticeable once a refresh replaced the
+     * preview with the raster - which is why it read as "changing tools resizes my strokes".
+     * Normalising against what the stroke actually reached puts its heaviest point at the
+     * configured width, matching the preview. Pressure still shapes the stroke internally; the
+     * floor keeps a genuinely feather-light stroke from being inflated to full width.
+     */
+    /**
+     * The pressure ceiling to re-render a stroke against: the device's own reported maximum, which
+     * is what the pen chip is configured with, so the committed raster is scaled the same way the
+     * preview was.
+     *
+     * This previously tried a session running maximum, reasoning that real strokes never approach
+     * the advertised 4096 so normalising against it renders them too thin. That was the wrong lever
+     * - it made the raster disagree with the preview in the other direction, which is charcoal
+     * suddenly growing on refresh. Whatever the firmware uses is by definition the right value, and
+     * matching it is the only way preview and raster agree; if strokes then read as too thin for
+     * the configured width, that belongs in the width or sensitivity, not in a divisor that only
+     * this side of the pipeline knows about.
+     */
+    private fun strokePressureCeiling(@Suppress("UNUSED_PARAMETER") strokeMaxPressure: Float): Float =
+        maxPressure()
+
+    /**
+     * Draws the in-progress stroke into its layer. Split out of onEndRawDrawing so a stroke that
+     * gets interrupted - the chip being reconfigured or raw input suppressed underneath it - can
+     * still be committed instead of silently thrown away. [hasRenderedThisStroke] keeps it to once.
+     */
+    private fun rasteriseCurrentStroke() {
+        val renderPts = chooseRenderPoints(strokeStyle)
+        val layer = layerById(strokeLayerId)
+        if (renderPts.size < 2 || hasRenderedThisStroke || layer == null) return
+        hasRenderedThisStroke = true
+        val copy = despike(ArrayList(renderPts), strokeWidthPx)
+        val source = if (renderPts === rawMovePoints) "rawMove" else "authority"
+        val sig = signalOf(renderPts)
+        val pressureCeiling = strokePressureCeiling(sig.maxPressure)
+        Log.d(
+            TAG,
+            "render: style=$strokeStyle erase=$strokeIsErase layer=$strokeLayerId source=$source pts=${copy.size} maxP=${sig.maxPressure} tiltNz=${sig.nonZeroTiltCount} " +
+                "rasterWidth=$strokeWidthPx chipWidth=$activeWidthPx viewScale=$strokeViewScale ceiling=$pressureCeiling"
+        )
+        val beforeBitmap = runCatching { layer.bitmap.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
+        runCatching {
+            if (strokeIsErase) {
+                OnyxStrokeRenderer.erase(strokeStyle, copy, strokeWidthPx, layer.canvas, pressureCeiling)
+            } else {
+                OnyxStrokeRenderer.render(strokeStyle, copy, strokeWidthPx, strokeColor, layer.canvas, pressureCeiling)
+            }
+        }.onFailure { e ->
+            Log.e(TAG, "render threw: ${e.javaClass.simpleName}: ${e.message}", e)
+        }
+        if (beforeBitmap != null) pushUndoEntry(strokeLayerId, beforeBitmap)
+        updateSnapshot(strokeLayerId)
+    }
+
+    /** Ends a stroke that won't get its own onEndRawDrawing, keeping the ink already drawn. */
+    private fun abandonStrokeKeepingInk(reason: String) {
+        if (!strokeInProgress) return
+        Log.w(TAG, "committing interrupted stroke ($reason)")
+        rasteriseCurrentStroke()
+        strokeInProgress = false
+        pendingPenUpRefresh = false
+        strokePoints.clear()
+        rawMovePoints.clear()
+        receivedAuthorityList = false
+        invalidateAndRefreshEpd(commitUpdateModeFor(strokeStyle))
+    }
 
     private fun maxPressure(): Float {
         val v = runCatching { EpdController.getMaxTouchPressure() }.getOrDefault(0f)
@@ -1017,6 +1313,14 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
 
     // Viewport gestures
 
+    /** Drops any in-flight pan/pinch state and re-enables raw input. Safe to call at any time. */
+    private fun releaseViewportGesture() {
+        viewGestureMode = ViewGestureMode.NONE
+        pinchTapEligible = false
+        setViewportGestureRawSuppressed(false)
+        parent?.requestDisallowInterceptTouchEvent(false)
+    }
+
     private fun handleViewportGesture(event: MotionEvent): Boolean {
         if (event.pointerCount <= 0) return false
 
@@ -1110,6 +1414,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         pinchAnchorWorldX = (focusX - viewOffsetX) / pinchStartScale
         pinchAnchorWorldY = (focusY - viewOffsetY) / pinchStartScale
         viewGestureMode = ViewGestureMode.PINCH
+        overviewPinchFired = false
         setViewportGestureRawSuppressed(true)
         panLastX = focusX
         panLastY = focusY
@@ -1161,13 +1466,22 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         val focusX = (x0 + x1) * 0.5f
         val focusY = (y0 + y1) * 0.5f
         val dist = max(1f, distance(x0, y0, x1, y1))
-        val newScale = (pinchStartScale * (dist / pinchStartDistance)).coerceIn(minViewScale, maxViewScale)
+        val rawScale = pinchStartScale * (dist / pinchStartDistance)
+        val newScale = rawScale.coerceIn(minViewScale, maxViewScale)
         viewScale = newScale
         viewOffsetX = focusX - pinchAnchorWorldX * newScale
         viewOffsetY = focusY - pinchAnchorWorldY * newScale
         clampViewport()
         notifyViewportChanged()
         invalidateSurface()
+
+        // Already at the zoom-out limit (newScale clamped) and still squeezing further inward:
+        // treat that overshoot past the limit as "give up on this canvas, show me all of them",
+        // the same rubber-band-past-the-edge gesture Notability/Freeform use for their overview.
+        if (!overviewPinchFired && rawScale < minViewScale * OVERVIEW_PINCH_EXIT_RATIO) {
+            overviewPinchFired = true
+            overviewPinchListener?.invoke()
+        }
     }
 
     private fun maybeFireTwoFingerTap() {
@@ -1416,7 +1730,11 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         val after = isEraseModeActive()
         if (before != after) {
             eraseModeListener?.invoke(after)
-            reconfigureTouchHelper()
+            // Immediate, not the 32ms debounce: the button is usually pressed as the pen is already
+            // coming down, and a debounced reconfigure that lands after touch-down gets deferred to
+            // avoid resetting the chip mid-stroke. The chip therefore kept previewing ink while the
+            // app erased for real at pen-up - erasing worked, but with no eraser preview under it.
+            reconfigureTouchHelperNow()
         }
     }
 
@@ -1627,9 +1945,13 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             ensureLayerStack(width, height)
             logRawPoint("begin", pt)
             val rawToolType = pt?.let { readTouchPointInt(it, "getToolType") }
+            // reconfigure = false: the chip cannot be reset mid-stroke anyway, so a reconfigure
+            // scheduled from here only lands after the stroke has finished and shows up as a stray
+            // refresh. The mode flip itself still counts - strokeIsErase below reads it - and the
+            // next idle-time change reconfigures properly.
             when (rawToolType) {
-                MotionEvent.TOOL_TYPE_ERASER -> setStylusTipEraserMode(true, reconfigure = true)
-                MotionEvent.TOOL_TYPE_STYLUS -> setStylusTipEraserMode(false, reconfigure = true)
+                MotionEvent.TOOL_TYPE_ERASER -> setStylusTipEraserMode(true, reconfigure = false)
+                MotionEvent.TOOL_TYPE_STYLUS -> setStylusTipEraserMode(false, reconfigure = false)
                 // Some firmware does not expose raw tool type; keep the mode from MotionEvent stream.
                 else -> Unit
             }
@@ -1643,16 +1965,8 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 return
             }
 
-            if (uiOverlayDirty) {
-                // A panel opened/closed over the canvas since the last stroke. Clear any stale
-                // hardware-overlay pixels left behind by that now, before the chip starts drawing
-                // fresh ink here - otherwise the new stroke visually draws over the old panel's
-                // leftover pixels instead of replacing them.
-                uiOverlayDirty = false
-                invalidateAndRefreshEpd(UpdateMode.GC)
-            }
-
             strokeInProgress = true
+            lastRawPointAtMs = System.currentTimeMillis()
             strokePoints.clear()
             rawMovePoints.clear()
             strokeStyle = activeStyle
@@ -1668,15 +1982,42 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             appendPoint(mapStrokePoint(pt))
             appendRawMovePoint(mapStrokePoint(pt))
             Log.d(TAG, "onBeginRawDrawing style=$activeStyle width=$activeWidthPx layer=$strokeLayerId")
+
+            // Deliberately after strokeInProgress is set: the Activity checks that to decide
+            // whether it can refresh the screen now or has to wait for pen-up (the pen chip owns
+            // the display mid-stroke), and reporting this first would make it refresh underneath
+            // the stroke that is just starting.
+            if (pt != null && stylusPointerListener != null) {
+                val loc = IntArray(2)
+                getLocationOnScreen(loc)
+                stylusPointerListener?.invoke(loc[0] + pt.x, loc[1] + pt.y)
+            }
+        }
+
+        /**
+         * Non-abstract SDK hook, so it has simply never been overridden here. If it fires before
+         * onBeginRawDrawing it is the missing piece for clearing a dismissed panel: the one thing
+         * that reliably repaints is dropping out of the raw session, which is impossible once a
+         * stroke owns the chip - but perfectly possible just before one starts. Logged rather than
+         * acted on until we know whether it means "pen approaching" or "pen down".
+         */
+        override fun onPenActive(pt: TouchPoint?) {
+            Log.i(
+                TAG,
+                "onPenActive at=${pt?.x},${pt?.y} strokeInProgress=$strokeInProgress " +
+                    "sinceLastRawPoint=${System.currentTimeMillis() - lastRawPointAtMs}ms"
+            )
         }
 
         override fun onRawDrawingTouchPointMoveReceived(pt: TouchPoint?) {
             logRawPoint("move", pt)
+            lastRawPointAtMs = System.currentTimeMillis()
             appendPoint(mapStrokePoint(pt))
             appendRawMovePoint(mapStrokePoint(pt))
         }
 
         override fun onRawDrawingTouchPointListReceived(list: TouchPointList?) {
+            lastRawPointAtMs = System.currentTimeMillis()
             val pts = list?.points ?: return
             if (pts.isEmpty()) return
             mergeAuthorityList(mapStrokePoints(pts))
@@ -1693,30 +2034,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             }
             appendRawMovePoint(mapStrokePoint(pt))
 
-            val renderPts = chooseRenderPoints(strokeStyle)
-            val layer = layerById(strokeLayerId)
-            if (renderPts.size >= 2 && !hasRenderedThisStroke && layer != null) {
-                hasRenderedThisStroke = true
-                val copy = despike(ArrayList(renderPts), strokeWidthPx)
-                val source = if (renderPts === rawMovePoints) "rawMove" else "authority"
-                val sig = signalOf(renderPts)
-                Log.d(
-                    TAG,
-                    "render: style=$strokeStyle erase=$strokeIsErase layer=$strokeLayerId source=$source pts=${copy.size} maxP=${sig.maxPressure} tiltNz=${sig.nonZeroTiltCount}"
-                )
-                val beforeBitmap = runCatching { layer.bitmap.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
-                runCatching {
-                    if (strokeIsErase) {
-                        OnyxStrokeRenderer.erase(strokeStyle, copy, strokeWidthPx, layer.canvas, maxPressure())
-                    } else {
-                        OnyxStrokeRenderer.render(strokeStyle, copy, strokeWidthPx, strokeColor, layer.canvas, maxPressure())
-                    }
-                }.onFailure { e ->
-                    Log.e(TAG, "render threw: ${e.javaClass.simpleName}: ${e.message}", e)
-                }
-                if (beforeBitmap != null) pushUndoEntry(strokeLayerId, beforeBitmap)
-                updateSnapshot(strokeLayerId)
-            }
+            rasteriseCurrentStroke()
 
             strokePoints.clear()
             rawMovePoints.clear()
@@ -1728,6 +2046,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 if (pendingPenUpRefresh) {
                     pendingPenUpRefresh = false
                     invalidateAndRefreshEpd(commitUpdateModeFor(strokeStyle))
+                    strokeFinishedListener?.invoke()
                 }
             }, 120L)
         }
@@ -1736,6 +2055,7 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             if (!pendingPenUpRefresh) return
             pendingPenUpRefresh = false
             invalidateAndRefreshEpd(commitUpdateModeFor(strokeStyle))
+            strokeFinishedListener?.invoke()
         }
 
         override fun onBeginRawErasing(success: Boolean, pt: TouchPoint?) {

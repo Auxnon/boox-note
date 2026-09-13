@@ -38,8 +38,10 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -65,7 +67,14 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "MainActivity"
         private const val PREFS_NAME = "boox_note_prefs"
         private const val KEY_LAST_OPEN_URI = "last_open_uri"
+        private const val KEY_LIVE_PREVIEW = "live_preview"
         private const val UI_TOUCH_WATCHDOG_MS = 4000L
+
+        /** Slack around a region repaint, so edge pixels of what was there don't survive it. */
+        private const val EINK_REGION_PAD_PX = 4
+
+        /** How long a deferred repaint waits for a stroke that may never arrive. */
+        private const val OVERLAY_REFRESH_FALLBACK_MS = 450L
         private const val TOOL_SLOT_COUNT = 3
         private const val TOOLBAR_ANIM_DURATION_MS = 220L
         private const val TOOLBAR_TAP_MAX_MOVEMENT_DP = 12f
@@ -105,6 +114,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonRemoveLayer: ImageButton
     private lateinit var layerAdapter: LayerListAdapter
     private val brushGridButtons = LinkedHashMap<HardwarePenStyle, ImageButton>(HardwarePenStyle.entries.size)
+
+    private lateinit var canvasStore: CanvasStore
+    private lateinit var canvasOverviewPanel: View
+    private lateinit var canvasOverviewRecycler: RecyclerView
+    private lateinit var canvasOverviewAdapter: CanvasOverviewAdapter
+    private lateinit var buttonNewCanvas: ImageButton
+    private var currentCanvasId: String = ""
+    private lateinit var livePreviewBtn: TextView
+    private var overlayRefreshOwed = false
+    private val pendingOverlayDirty = Rect()
+    private var overlayRefreshFallback: Runnable? = null
+    private val thumbnailCache = HashMap<String, Bitmap?>()
 
     /**
      * Handheld e-ink panels (e.g. Boox Palma Pro 2, ~6.1") are physically small but often very
@@ -242,6 +263,10 @@ class MainActivity : AppCompatActivity() {
         buttonEraser = findViewById(R.id.buttonEraser)
         buttonAddLayer = findViewById(R.id.buttonAddLayer)
         buttonRemoveLayer = findViewById(R.id.buttonRemoveLayer)
+        findViewById<TextView>(R.id.buildVersionLabel).text = "v${BuildConfig.VERSION_NAME}"
+        canvasOverviewPanel = findViewById(R.id.canvasOverviewPanel)
+        canvasOverviewRecycler = findViewById(R.id.canvasOverviewRecycler)
+        buttonNewCanvas = findViewById(R.id.buttonNewCanvas)
 
         val loadBtn = findViewById<View>(R.id.buttonLoad)
         val clearLayerBtn = findViewById<View>(R.id.buttonClearLayer)
@@ -251,6 +276,7 @@ class MainActivity : AppCompatActivity() {
         val shareBtn = findViewById<View>(R.id.buttonShare)
         val resetViewBtn = findViewById<View>(R.id.buttonResetView)
         val aboutBtn = findViewById<View>(R.id.buttonAbout)
+        livePreviewBtn = findViewById(R.id.buttonToggleLivePreview)
 
         setupToolbarPill()
         setupToolSlots()
@@ -258,6 +284,7 @@ class MainActivity : AppCompatActivity() {
         setupBrushGrid()
         setupLayerPanel()
         setupLayerPanelDrag()
+        setupCanvasOverview()
         penView.setOnViewportChangedListener { scale ->
             runOnUiThread { updateZoomLabel(scale) }
         }
@@ -326,6 +353,9 @@ class MainActivity : AppCompatActivity() {
             resetViewport()
             updateRawSuppression()
         }
+        livePreviewBtn.setOnClickListener { setLivePreview(!penView.isTexturedPencilPreview()) }
+        guardRawMode(livePreviewBtn)
+        setLivePreview(prefs().getBoolean(KEY_LIVE_PREVIEW, false))
         aboutBtn.setOnClickListener {
             fileMenuPanel.visibility = View.GONE
             showAboutDialog()
@@ -350,6 +380,24 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        penView.setOnStrokeFinishedListener {
+            runOnUiThread { if (overlayRefreshOwed) flushOverlayRefresh() }
+        }
+        penView.setOnStrokeStartListener { screenX, screenY ->
+            // The pen bypasses dispatchTouchEvent() entirely while the raw session is open, so this
+            // is what gives a stylus the same "draw somewhere else and the panel closes" behaviour
+            // a finger tap gets for free there.
+            if (!anyDismissablePanelVisible()) return@setOnStrokeStartListener
+            runOnUiThread {
+                val dismissed = dismissPanelsIfTappedOutside(screenX, screenY)
+                Log.i(
+                    TAG,
+                    "stroke started at $screenX,$screenY with a panel open: " +
+                        "dismissed=$dismissed modal=${toolModalPanel.visibility == View.VISIBLE} " +
+                        "modalRect=${Rect().also { unionScreenBounds(it, toolModalPanel) }}"
+                )
+            }
+        }
 
         applyActiveToolToPenView()
         refreshToolSlotVisuals()
@@ -358,6 +406,7 @@ class MainActivity : AppCompatActivity() {
         updateRawSuppression()
         updateZoomLabel(penView.getViewScale())
         handleIncomingViewIntent(intent)
+        loadInitialCanvas()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -549,6 +598,14 @@ class MainActivity : AppCompatActivity() {
         toolbarPill.y = toolbarDragOutline.y
         toolbarDragOutline.visibility = View.GONE
         toolbarPill.visibility = View.VISIBLE
+        scheduleToolbarExclusionUpdate()
+    }
+
+    /** The toolbar's pen-exclusion rect has to follow it after a move/resize. Position changes are
+     *  translations rather than layout passes, so nothing recomputes them on its own - and both the
+     *  snap and the minimize/expand are animated, so this waits for the animation to land. */
+    private fun scheduleToolbarExclusionUpdate() {
+        rootFrame.postDelayed({ updateRawSuppression() }, TOOLBAR_ANIM_DURATION_MS + 32L)
     }
 
     /** 3x3 split by thirds of how far the toolbar was actually dragged within its OWN achievable
@@ -637,6 +694,7 @@ class MainActivity : AppCompatActivity() {
         lp.height = h
         toolbarPill.layoutParams = lp
         toolbarPill.animate().x(targetX).y(targetY).setDuration(TOOLBAR_ANIM_DURATION_MS).start()
+        scheduleToolbarExclusionUpdate()
     }
 
     /**
@@ -758,7 +816,10 @@ class MainActivity : AppCompatActivity() {
             toolbarPill.layoutParams = lp
         }
         animator.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) = onEnd()
+            override fun onAnimationEnd(animation: Animator) {
+                onEnd()
+                scheduleToolbarExclusionUpdate()
+            }
         })
         animator.start()
     }
@@ -862,28 +923,40 @@ class MainActivity : AppCompatActivity() {
         refreshModalContents()
         ensureOverlayOrder()
         updateRawSuppression()
+        // New content appearing here doesn't reach the physical panel on its own - see
+        // refreshModalPanelEink() - so without this the modal (or a section inside it that
+        // becomes visible later) stays blank until something else happens to trigger a refresh.
+        refreshModalPanelEink()
     }
 
-    private fun closeToolModal() {
-        if (toolModalPanel.visibility != View.VISIBLE) return
-        toolModalPanel.visibility = View.GONE
-        hideToolModalSections()
-        updateRawSuppression()
-        // Immediate, not the lazy markUiOverlayDirty() - this only fires once per close (picking
-        // things inside the modal doesn't call this), so it isn't the flood source; the flood was
-        // the per-pick hardware-style-change refresh in HardwarePenSurfaceView, fixed separately.
-        penView.forceEinkRefresh()
+    private fun closeToolModal() = closePanel(toolModalPanel) { hideToolModalSections() }
+
+    /** Lightweight refresh scoped to the modal panel itself - for content changes confined to it
+     *  (opening it, or toggling one of its sections) where the canvas underneath isn't affected. */
+    private fun refreshModalPanelEink() {
+        val updateMode = if (isHandheldEinkPanel) UpdateMode.DU else UpdateMode.GU
+        toolModalPanel.post {
+            toolModalPanel.invalidate()
+            runCatching {
+                EpdController.invalidate(toolModalPanel, updateMode)
+                EpdController.refreshScreen(toolModalPanel, updateMode)
+            }
+        }
     }
 
+    /** Only the colour wheel collapses. The size slider stays mounted: it's the control people
+     *  reach for most, and toggling it shifted everything below it down as it appeared. */
     private fun hideToolModalSections() {
         modalColorSection.visibility = View.GONE
-        modalSizeSection.visibility = View.GONE
+        modalSizeSection.visibility = View.VISIBLE
     }
 
     private fun refreshModalContents() {
         val preset = toolPresets[selectedToolIndex]
         modalColorButton.background = createSwatchDrawable(preset.color, selected = false)
-        modalSizeButton.text = "Size: ${preset.widthPx.roundToInt()} px"
+        // Names the brush, not just the size: the tip icons are near-identical at this size, so
+        // there was otherwise nothing on screen saying which brush a tool slot actually holds.
+        modalSizeButton.text = "${preset.style.label} · ${preset.widthPx.roundToInt()} px"
         modalSizeSeekBar.progress = widthToProgress(preset.widthPx)
         modalSizeValueLabel.text = "${preset.widthPx.roundToInt()} px"
         modalColorPickerView.setColor(preset.color)
@@ -928,27 +1001,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupToolModal() {
         modalColorButton.setOnClickListener {
-            modalSizeSection.visibility = View.GONE
-            modalColorSection.visibility = if (modalColorSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        }
-        modalSizeButton.setOnClickListener {
-            modalColorSection.visibility = View.GONE
-            val opening = modalSizeSection.visibility != View.VISIBLE
-            modalSizeSection.visibility = if (opening) View.VISIBLE else View.GONE
-            if (opening) {
-                // A SeekBar that was GONE (never measured/laid out) doesn't reliably paint its
-                // progressDrawable the first time it becomes visible - it only showed up once
-                // touched, which forces the same internal redraw this does directly.
-                modalSizeSeekBar.jumpDrawablesToCurrentState()
-            }
+            modalColorSection.visibility =
+                if (modalColorSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            // Showing/hiding a view never reaches the physical e-ink panel on its own (same class
+            // of bug as every other UI change in this app), so push a refresh for the new layout.
+            refreshModalPanelEink()
         }
         modalColorPickerView.onColorChanged = { color ->
             // No forced e-ink refresh here on purpose: this fires on every touch-move while
             // dragging the color wheel, and forcing a hardware refresh per move flashed the
             // screen dozens of times per drag. Plain view updates (this button, the tool slot
             // icon tint) are enough to read while the modal's open; the canvas itself only
-            // actually needs a real refresh once drawing resumes, which penView already handles
-            // lazily via markUiOverlayDirty() when this panel closes.
+            // actually needs a real refresh once drawing resumes, which closeToolModal() already
+            // handles via refreshUiAfterOverlayDismiss() when this panel closes.
             toolPresets[selectedToolIndex].color = color
             penView.setStrokeColor(color)
             modalColorButton.background = createSwatchDrawable(color, selected = false)
@@ -959,8 +1024,9 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(sb: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
                 val width = progressToWidth(progress)
-                toolPresets[selectedToolIndex].widthPx = width
-                modalSizeButton.text = "Size: ${width.roundToInt()} px"
+                val preset = toolPresets[selectedToolIndex]
+                preset.widthPx = width
+                modalSizeButton.text = "${preset.style.label} · ${width.roundToInt()} px"
                 modalSizeValueLabel.text = "${width.roundToInt()} px"
                 penView.setStrokeWidthPx(width)
             }
@@ -987,10 +1053,30 @@ class MainActivity : AppCompatActivity() {
             }
             guardRawMode(btn)
             brushGridButtons[style] = btn
+            // The tip icons alone are too alike to tell apart at a glance - which matters because
+            // the brushes behave very differently - so each one is labelled with its name.
+            val cell = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                addView(btn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(44)))
+                addView(
+                    TextView(this@MainActivity).apply {
+                        text = style.label
+                        textSize = 10f
+                        setTextColor(Color.parseColor("#222222"))
+                        gravity = Gravity.CENTER
+                        maxLines = 1
+                    },
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                )
+            }
             val row = if (index < perRow) row1 else row2
             row.addView(
-                btn,
-                LinearLayout.LayoutParams(0, dp(56), 1f).also {
+                cell,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).also {
                     if (index % perRow != 0) it.marginStart = dp(4)
                 }
             )
@@ -1000,7 +1086,9 @@ class MainActivity : AppCompatActivity() {
     private fun onGridBrushSelected(style: HardwarePenStyle) {
         val preset = toolPresets[selectedToolIndex]
         preset.style = style
-        preset.widthPx = style.defaultWidthPx
+        // Width stays with the tool slot, not the brush: it used to be reset to the new brush's
+        // default here, so a slot deliberately set wide snapped back the moment its brush changed.
+        // The slot keeps whatever it was last set to; only its starting value comes from the brush.
         penView.setStyle(style)
         penView.setStrokeWidthPx(preset.widthPx)
         refreshModalContents()
@@ -1124,8 +1212,12 @@ class MainActivity : AppCompatActivity() {
             closeToolModal()
             positionPopupNearToolbar(layerPanel)
         }
-        layerPanel.visibility = if (willShow) View.VISIBLE else View.GONE
-        if (willShow) refreshLayerPanel() else penView.forceEinkRefresh()
+        if (willShow) {
+            layerPanel.visibility = View.VISIBLE
+            refreshLayerPanel()
+        } else {
+            closePanel(layerPanel)
+        }
         ensureOverlayOrder()
         updateRawSuppression()
     }
@@ -1135,10 +1227,10 @@ class MainActivity : AppCompatActivity() {
         if (willShow) {
             closeToolModal()
             positionPopupNearToolbar(fileMenuPanel)
+            fileMenuPanel.visibility = View.VISIBLE
         } else {
-            penView.forceEinkRefresh()
+            closePanel(fileMenuPanel)
         }
-        fileMenuPanel.visibility = if (willShow) View.VISIBLE else View.GONE
         ensureOverlayOrder()
         updateRawSuppression()
     }
@@ -1435,6 +1527,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadDpaintDocument(uri: Uri): Boolean {
         val text = readUriText(uri) ?: return false
+        return applyDpaintJson(text)
+    }
+
+    /** Parses a dpaint-format JSON document (the same format loadDpaintDocument() above reads
+     *  from a user-picked Uri) and replaces the current document with it - shared with the
+     *  internal multi-canvas store, which keeps each canvas as one of these files on disk. */
+    private fun applyDpaintJson(text: String): Boolean {
         val root = runCatching { JSONObject(text) }.getOrNull() ?: return false
         if (!root.optString("type").equals("dpaint", ignoreCase = true)) return false
 
@@ -1483,6 +1582,141 @@ class MainActivity : AppCompatActivity() {
             resetViewport()
         }
         return ok
+    }
+
+    // ─── Multi-canvas overview: separate persisted documents, switchable from a pinch gesture ──
+
+    private fun setupCanvasOverview() {
+        canvasStore = CanvasStore(this)
+        canvasOverviewAdapter = CanvasOverviewAdapter(
+            onOpen = { meta -> openCanvas(meta.id) },
+            onRename = { meta -> promptRenameCanvas(meta) },
+            thumbnailFor = { meta -> thumbnailCache.getOrPut(meta.id) { canvasStore.loadThumbnail(meta.id) } },
+        )
+        canvasOverviewRecycler.layoutManager = GridLayoutManager(this, 2)
+        canvasOverviewRecycler.adapter = canvasOverviewAdapter
+        buttonNewCanvas.setOnClickListener { createAndOpenNewCanvas() }
+        guardRawMode(canvasOverviewPanel)
+        guardRawMode(buttonNewCanvas)
+        guardRawMode(canvasOverviewRecycler)
+
+        penView.setOnOverviewPinchListener {
+            runOnUiThread { showCanvasOverview() }
+        }
+    }
+
+    /** Loads whichever canvas was open last (or creates the very first one, on a fresh install).
+     *  Deferred until the view is actually laid out - loading a document needs a real width/height
+     *  to fit its layers into, which isn't available yet during onCreate(). */
+    private fun loadInitialCanvas() {
+        penView.post {
+            var canvases = canvasStore.listCanvases()
+            if (canvases.isEmpty()) {
+                val first = canvasStore.createCanvas()
+                canvasStore.setLastOpenId(first.id)
+                canvases = listOf(first)
+            }
+            val targetId = canvasStore.lastOpenId()?.takeIf { id -> canvases.any { it.id == id } }
+                ?: canvases.first().id
+            currentCanvasId = targetId
+            canvasStore.setLastOpenId(targetId)
+            // An incoming ACTION_VIEW ("open with") intent takes priority over the last-open
+            // canvas - don't clobber what it's about to load with this default.
+            if (pendingIncomingViewUri == null) {
+                val docFile = canvasStore.docFile(targetId)
+                if (docFile.exists()) {
+                    val text = runCatching { docFile.readText() }.getOrNull()
+                    if (text != null) applyDpaintJson(text)
+                }
+            }
+            refreshLayerPanel()
+        }
+    }
+
+    /** Writes the current document + a fresh thumbnail for [currentCanvasId] to disk. Called
+     *  before switching away from it (overview, picking another canvas, new canvas) and on
+     *  pause/stop, so canvases persist without needing an explicit "save" action every stroke -
+     *  which would be far too expensive to do on every one on e-ink hardware. */
+    private fun saveCurrentCanvasToDisk() {
+        if (currentCanvasId.isBlank()) return
+        val snapshot = penView.snapshotDocumentForExport() ?: return
+        val meta = canvasStore.listCanvases().find { it.id == currentCanvasId }
+        val name = meta?.name ?: "Canvas"
+        runCatching {
+            val json = buildDpaintJson(snapshot, name)
+            canvasStore.docFile(currentCanvasId).writeText(json.toString())
+        }
+        val thumb = penView.exportBitmap()
+        if (thumb != null) {
+            canvasStore.saveThumbnail(currentCanvasId, thumb)
+            thumbnailCache[currentCanvasId] = thumb
+        }
+        snapshot.layers.forEach { if (!it.bitmap.isRecycled) it.bitmap.recycle() }
+    }
+
+    private fun showCanvasOverview() {
+        saveCurrentCanvasToDisk()
+        closeToolModal()
+        layerPanel.visibility = View.GONE
+        fileMenuPanel.visibility = View.GONE
+        canvasOverviewAdapter.submit(canvasStore.listCanvases())
+        canvasOverviewPanel.visibility = View.VISIBLE
+        canvasOverviewPanel.bringToFront()
+        updateRawSuppression()
+        refreshUiAfterOverlayDismiss()
+    }
+
+    private fun hideCanvasOverview() {
+        canvasOverviewPanel.visibility = View.GONE
+        updateRawSuppression()
+        refreshUiAfterOverlayDismiss()
+    }
+
+    private fun openCanvas(id: String) {
+        if (id == currentCanvasId) {
+            hideCanvasOverview()
+            return
+        }
+        currentCanvasId = id
+        canvasStore.setLastOpenId(id)
+        val docFile = canvasStore.docFile(id)
+        val text = if (docFile.exists()) runCatching { docFile.readText() }.getOrNull() else null
+        if (text != null) {
+            applyDpaintJson(text)
+        } else {
+            penView.resetToBlankDocument()
+            refreshLayerPanel()
+            resetViewport()
+        }
+        hideCanvasOverview()
+    }
+
+    private fun createAndOpenNewCanvas() {
+        saveCurrentCanvasToDisk()
+        val meta = canvasStore.createCanvas()
+        currentCanvasId = meta.id
+        canvasStore.setLastOpenId(meta.id)
+        penView.resetToBlankDocument()
+        refreshLayerPanel()
+        resetViewport()
+        hideCanvasOverview()
+    }
+
+    private fun promptRenameCanvas(meta: CanvasMeta) {
+        val input = android.widget.EditText(this).apply {
+            setText(meta.name)
+            setSelection(meta.name.length)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Rename canvas")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                canvasStore.renameCanvas(meta.id, input.text.toString())
+                canvasOverviewAdapter.submit(canvasStore.listCanvases())
+                refreshUiAfterOverlayDismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun buildDpaintJson(
@@ -1671,15 +1905,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateRawSuppression() {
+        // Floating panels deliberately aren't in this list: switching the pen off entirely is what
+        // made "start drawing and the modal gets out of the way" unreliable (see
+        // setRawExclusionRects). They carve themselves out of the pen's active area instead, below.
+        // The overview stays a hard suppression - it replaces the canvas, so there's nothing to
+        // draw on and nothing to carve out.
         val suppress = activityPaused ||
             pickerInFlight ||
             aboutDialogVisible ||
             eraserUiTransitionInFlight ||
             uiTouchDepth > 0 ||
-            layerPanel.visibility == View.VISIBLE ||
-            toolModalPanel.visibility == View.VISIBLE ||
-            fileMenuPanel.visibility == View.VISIBLE
+            canvasOverviewPanel.visibility == View.VISIBLE
         penView.setRawInputSuppressed(suppress)
+        // Deferred a frame: a panel that just became visible hasn't been positioned or measured
+        // yet, so its bounds aren't readable until layout has run. setRawExclusionRects() ignores
+        // no-op updates, so coalescing repeats here is harmless.
+        penView.post { penView.setRawExclusionRects(openPanelRectsInPenView()) }
+    }
+
+    /** Bounds of the toolbar plus every open floating panel, in penView's coordinate space. The
+     *  toolbar is always in here: it floats over the canvas, so without it the pen draws straight
+     *  through the buttons. */
+    private fun openPanelRectsInPenView(): List<Rect> {
+        val panels = listOf(toolbarPill, toolModalPanel, layerPanel, fileMenuPanel)
+        val penLoc = IntArray(2)
+        penView.getLocationOnScreen(penLoc)
+        val out = ArrayList<Rect>(panels.size)
+        panels.forEach { panel ->
+            if (panel.visibility != View.VISIBLE) return@forEach
+            val r = Rect()
+            if (!panel.getGlobalVisibleRect(r)) return@forEach
+            r.offset(-penLoc[0], -penLoc[1])
+            out.add(r)
+        }
+        return out
     }
 
     private fun showAboutDialog() {
@@ -1740,7 +1999,12 @@ class MainActivity : AppCompatActivity() {
             MotionEvent.ACTION_POINTER_DOWN,
             MotionEvent.ACTION_UP,
             MotionEvent.ACTION_POINTER_UP -> {
-                if (dismissPanelsIfTappedOutside(ev.rawX, ev.rawY)) return true
+                // A stylus DOWN here is the pen about to start a stroke: now that panels carve
+                // themselves out of the pen's area instead of switching it off, pen touches reach
+                // normal dispatch again and land here *before* onBeginRawDrawing. Repainting
+                // immediately would put the refresh microseconds ahead of the chip taking over the
+                // display, which then overdraws it - so tell the refresh to wait for pen-up.
+                if (dismissPanelsIfTappedOutside(ev.rawX, ev.rawY, isStylusEvent(ev))) return true
             }
         }
         return super.dispatchTouchEvent(ev)
@@ -1765,66 +2029,174 @@ class MainActivity : AppCompatActivity() {
                 "stylusKey action=$action key=${KeyEvent.keyCodeToString(event.keyCode)} " +
                     "repeat=${event.repeatCount} source=0x${event.source.toString(16)} device=${event.device?.name}"
             )
+            // Key events arrive on the button press itself, before the pen touches down - the only
+            // signal early enough to reconfigure the chip for the erase preview, which is exactly
+            // what makes the eraser *tool* work. The button reported through MotionEvent.buttonState
+            // and through the raw tool type both arrive too late (the latter not until the stroke
+            // has already begun), so this is what erase gets armed from.
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> penView.setStylusButtonEraserMode(true)
+                KeyEvent.ACTION_UP -> penView.setStylusButtonEraserMode(false)
+            }
         }
         return super.dispatchKeyEvent(event)
     }
 
-    private fun dismissPanelsIfTappedOutside(rawX: Float, rawY: Float): Boolean {
-        var dismissed = false
+    /**
+     * Switches between the pen chip drawing the live stroke and us drawing it.
+     *
+     * Drawing the preview ourselves turned out to be impossible - the only feature flag that
+     * delivers pen input on this device is the one where the chip draws - so the lever we do have
+     * is which brush it previews with. Charcoal previews with texture, much closer to the pencil's
+     * grainy bake than the chip's flat pencil dabs, at the cost of not being literally a pencil.
+     */
+    private fun setLivePreview(enabled: Boolean) {
+        penView.setTexturedPencilPreview(enabled)
+        livePreviewBtn.text = if (enabled) "Textured preview: on" else "Textured preview: off"
+        prefs().edit().putBoolean(KEY_LIVE_PREVIEW, enabled).apply()
+    }
+
+    private fun anyDismissablePanelVisible(): Boolean =
+        toolModalPanel.visibility == View.VISIBLE ||
+            layerPanel.visibility == View.VISIBLE ||
+            fileMenuPanel.visibility == View.VISIBLE
+
+    private fun isStylusEvent(ev: MotionEvent): Boolean {
+        for (i in 0 until ev.pointerCount) {
+            val tool = ev.getToolType(i)
+            if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) return true
+        }
+        return false
+    }
+
+    private fun dismissPanelsIfTappedOutside(
+        rawX: Float,
+        rawY: Float,
+        fromStylus: Boolean = false,
+    ): Boolean {
+        val vacated = Rect()
 
         if (layerPanel.visibility == View.VISIBLE &&
             !isPointInsideView(layerPanel, rawX, rawY) &&
             !isPointInsideView(buttonLayers, rawX, rawY)
         ) {
-            layerPanel.visibility = View.GONE
-            dismissed = true
+            hidePanelInto(vacated, layerPanel)
         }
 
         if (fileMenuPanel.visibility == View.VISIBLE &&
             !isPointInsideView(fileMenuPanel, rawX, rawY) &&
             !isPointInsideView(buttonMenu, rawX, rawY)
         ) {
-            fileMenuPanel.visibility = View.GONE
-            dismissed = true
+            hidePanelInto(vacated, fileMenuPanel)
         }
 
         if (toolModalPanel.visibility == View.VISIBLE &&
             !isPointInsideView(toolModalPanel, rawX, rawY) &&
             toolSlotButtons.none { isPointInsideView(it, rawX, rawY) }
         ) {
-            toolModalPanel.visibility = View.GONE
+            hidePanelInto(vacated, toolModalPanel)
             hideToolModalSections()
-            dismissed = true
         }
 
-        if (dismissed) {
-            updateRawSuppression()
-            refreshUiAfterOverlayDismiss()
-        }
-        return dismissed
+        if (vacated.isEmpty) return false
+        updateRawSuppression()
+        refreshUiAfterOverlayDismiss(vacated, deferToStrokeEnd = fromStylus)
+        return true
     }
 
-    private fun refreshUiAfterOverlayDismiss() {
+    /** Grows [target] to cover [view]'s current on-screen bounds. Must be read before hiding it. */
+    private fun unionScreenBounds(target: Rect, view: View) {
+        val r = Rect()
+        if (view.getGlobalVisibleRect(r)) target.union(r)
+    }
+
+    /** Hides [panel], recording the screen area it frees up into [vacated] so only that area has
+     *  to be repainted afterwards. Every panel-closing path goes through here. */
+    private fun hidePanelInto(vacated: Rect, panel: View) {
+        if (panel.visibility != View.VISIBLE) return
+        unionScreenBounds(vacated, panel)
+        panel.visibility = View.GONE
+    }
+
+    /** Closes a single panel and repaints just the area it vacated. */
+    private fun closePanel(panel: View, onHidden: () -> Unit = {}) {
+        if (panel.visibility != View.VISIBLE) return
+        val vacated = Rect()
+        hidePanelInto(vacated, panel)
+        onHidden()
+        updateRawSuppression()
+        refreshUiAfterOverlayDismiss(vacated)
+    }
+
+    /**
+     * Repaints the area a dismissed panel just vacated. [vacatedOnScreen] is that area in screen
+     * coordinates, captured before the panel was hidden; an empty rect falls back to the whole view.
+     */
+    private fun refreshUiAfterOverlayDismiss(
+        vacatedOnScreen: Rect = Rect(),
+        deferToStrokeEnd: Boolean = false,
+    ) {
+        pendingOverlayDirty.union(vacatedOnScreen)
+        if (deferToStrokeEnd || penView.isStrokeInProgress()) {
+            // The pen chip owns the display for the duration of a raw stroke, and a refresh issued
+            // underneath it doesn't survive - it gets dropped or immediately overdrawn by the
+            // hardware preview layer. That's why dismissing a panel by drawing left the panel's
+            // pixels on screen even though the view was already gone: it looked like "the modal
+            // won't close", but it had closed, which is why it stopped responding to taps.
+            overlayRefreshOwed = true
+            Log.i(TAG, "overlay refresh deferred until stroke ends")
+            // ...but try to clear it *now* as well. Deferring alone meant the stroke was drawn over
+            // the panel's leftover pixels for its whole duration and only came good on pen-up.
+            // This is the one repaint that can land inside a live handwriting session.
+            rootFrame.post { penView.handwritingRepaintRegion(toPenViewRegion(pendingOverlayDirty)) }
+            overlayRefreshFallback?.let { rootFrame.removeCallbacks(it) }
+            // A pen touch that dismisses a panel but never becomes a stroke (a tap, or a stroke the
+            // chip rejects) would otherwise leave the area un-repainted for good.
+            val fallback = Runnable {
+                if (overlayRefreshOwed && !penView.isStrokeInProgress()) flushOverlayRefresh()
+            }
+            overlayRefreshFallback = fallback
+            rootFrame.postDelayed(fallback, OVERLAY_REFRESH_FALLBACK_MS)
+            return
+        }
+        flushOverlayRefresh()
+    }
+
+    private fun flushOverlayRefresh() {
+        overlayRefreshOwed = false
+        overlayRefreshFallback?.let { rootFrame.removeCallbacks(it) }
+        overlayRefreshFallback = null
+        val dirty = Rect(pendingOverlayDirty)
+        pendingOverlayDirty.setEmpty()
         rootFrame.post {
             rootFrame.invalidate()
             penView.invalidate()
-            // On e-ink, invalidate() alone only redraws into the Android-level buffer - the
-            // physical panel doesn't repaint until an actual EpdController refresh is issued (same
-            // class of bug as the earlier brush-switch blanking). Without this, a dismissed panel
-            // (e.g. the color picker) leaves its stale pixels sitting on screen indefinitely.
-            // penView also gets its own dedicated refresh: a generic decor-level one doesn't
-            // reliably reach the raw hardware ink overlay it drives (a separate compositing path
-            // below the normal view hierarchy), which otherwise leaves stale hardware-drawn pixels
-            // that a new stroke then draws over instead of replacing.
-            penView.forceEinkRefresh()
+            // Nested post, not one: the outer one can run *before* the traversal that actually
+            // redraws the frame without the panel in it, so refreshing there pushes the panel's own
+            // stale pixels back onto the display and then nothing refreshes again. By the inner
+            // post the new frame has been drawn. (Collapsing these two into one is exactly what
+            // made a dismissed modal keep sitting there.)
             rootFrame.post {
-                runCatching {
-                    val decor = window?.decorView ?: rootFrame
-                    EpdController.invalidate(decor, UpdateMode.GC)
-                    EpdController.refreshScreen(decor, UpdateMode.GC)
-                }
+                val region = toPenViewRegion(dirty)
+                Log.i(TAG, "overlay repaint region=$region")
+                // Goes through penView so the repaint can step outside the pen chip's raw session -
+                // issuing it from here while that session is live was silently swallowed.
+                penView.refreshRegionOutsideRawSession(region)
             }
         }
+    }
+
+    /** Converts a screen-space rect to penView-relative, padded slightly and clipped to it.
+     *  Returns null if it isn't usable, so the caller can fall back to a full refresh. */
+    private fun toPenViewRegion(screenRect: Rect): Rect? {
+        if (screenRect.isEmpty) return null
+        val loc = IntArray(2)
+        penView.getLocationOnScreen(loc)
+        val r = Rect(screenRect)
+        r.offset(-loc[0], -loc[1])
+        r.inset(-EINK_REGION_PAD_PX, -EINK_REGION_PAD_PX)
+        if (!r.intersect(0, 0, penView.width, penView.height)) return null
+        return if (r.isEmpty) null else r
     }
 
     private fun isPointInsideView(view: View, rawX: Float, rawY: Float): Boolean {
@@ -1837,6 +2209,7 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         activityPaused = true
         updateRawSuppression()
+        saveCurrentCanvasToDisk()
     }
 
     override fun onResume() {
