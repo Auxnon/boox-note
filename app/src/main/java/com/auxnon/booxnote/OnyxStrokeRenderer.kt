@@ -282,6 +282,26 @@ object OnyxStrokeRenderer {
         }
     }
 
+    /**
+     * The device's own tilt parameters for a stroke style: (enabled, scale), or null if it reports
+     * none. Read once per style and cached - it is a fixed property of the hardware.
+     */
+    private val tiltParamCache = HashMap<Int, Pair<Boolean, Float>?>()
+
+    private fun deviceTiltParameters(strokeStyle: Int): Pair<Boolean, Float>? =
+        tiltParamCache.getOrPut(strokeStyle) {
+            val params = runCatching {
+                com.onyx.android.sdk.device.Device.currentDevice().getStrokeParameters(strokeStyle)
+            }.getOrNull()
+            if (params == null || params.size < 2) {
+                null
+            } else {
+                Pair(params[0] != 0f, params[1]).also {
+                    android.util.Log.i("PencilNative", "device tilt params for style $strokeStyle: $it")
+                }
+            }
+        }
+
     private var pencilMask: Bitmap? = null
 
     private fun pencilMask(): Bitmap? {
@@ -511,31 +531,23 @@ object OnyxStrokeRenderer {
         val safeMaxPressure = max(1f, maxPressure)
         val screenMatrix = Matrix()
         val baseConfig = runCatching { NeoPencilPen.Companion.defaultPenConfig() }.getOrNull() ?: NeoPenConfig()
+        // Tilt settings come from the device, not from us. Onyx's own demo builds its charcoal
+        // TiltConfig from Device.currentDevice().getStrokeParameters(strokeStyle) - [0] is whether
+        // tilt applies to that brush, [1] the scale it should use - so the firmware ships the
+        // correct per-brush values and there is no need to guess them. Every value tried here by
+        // hand (TILT_SCALE_VALUE, then nothing at all) was a guess at exactly this.
+        val tilt = deviceTiltParameters(HardwarePenStyle.PENCIL.hardwareStrokeStyle)
         val penConfig = baseConfig
             .setColor(color)
             .setWidth(widthPx)
-            .setTiltEnabled(true)
+            .setTiltEnabled(tilt?.first ?: true)
             .setRotateAngle(0)
             .setMaxTouchPressure(safeMaxPressure)
+        tilt?.second?.let { penConfig.tiltScale = it }
         // pressureSensitivity and minWidth are deliberately left as defaultPenConfig() set them
         // (0.3 and 1.0). Forcing sensitivity to 1.0 - copied from the charcoal path, which builds a
         // bare config - makes stamp size track raw pressure almost entirely, so a normal press
-        // (~0.4 of the 4096 ceiling) rendered an 80px pencil at roughly a third of its width and no
-        // amount of widening helped. The pencil's own default keeps it near the configured width
-        // and lets pressure modulate it rather than define it.
-        // Tilt magnitude alone only broadens the stroke as the pen leans. This is what makes it
-        // broaden *along the direction of the lean* - real side shading. The digitizer reports that
-        // direction as a tilt vector on each TouchPoint (tiltX/tiltY, whose atan2 is the azimuth);
-        // MotionEvent.AXIS_ORIENTATION reads a flat zero on this hardware, which is why azimuth
-        // looked like it wasn't detected at all. The data was always arriving - the engine was
-        // simply never told to use it, leaving tiltEnabled doing half the job.
-        // directionEnabled/tiltScale are deliberately NOT set here any more, matching the charcoal
-        // config - which is the one brush whose tilt shading behaves correctly. Charcoal sets only
-        // colour, width, tiltEnabled, rotateAngle and maxTouchPressure on a bare config and leaves
-        // everything else alone; pencil setting tiltScale to TILT_SCALE_VALUE (5.0) on top of that
-        // was the main divergence between the two, and pencil is the one whose stamps came out
-        // pinned near minimum size. Keeping the working brush's recipe is a better starting point
-        // than a value we only guessed was right because a constant of that name existed.
+        // (~0.4 of the 4096 ceiling) rendered an 80px pencil at roughly a third of its width.
 
         val pen: NeoPen = NeoPencilPen.Companion.create(penConfig) ?: return false
 
