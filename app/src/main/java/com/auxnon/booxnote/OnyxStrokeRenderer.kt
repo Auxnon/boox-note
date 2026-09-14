@@ -844,7 +844,12 @@ object OnyxStrokeRenderer {
             .setTiltEnabled(true)
             .setRotateAngle(0)
             .setMaxTouchPressure(safeMaxPressure)
-        penConfig.pressureSensitivity = 1.0f
+        // 0.3, matching the value NeoPencilPen's own defaultPenConfig() ships - the same change
+        // that stopped the pencil rendering at a third of its set width. At 1.0 stamp size tracks
+        // raw pressure almost entirely, and the engine then also widens with tilt on top, which is
+        // the bake coming out around twice the preview at rest and roughly four times when leaned.
+        // The chip previewing the same brush does neither, so the two disagreed by exactly this.
+        penConfig.pressureSensitivity = 0.3f
         penConfig.minWidth = 1.0f
 
         val pen: NeoPen = if (v2) {

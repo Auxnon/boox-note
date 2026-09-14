@@ -1263,7 +1263,11 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
      * Those get a fuller-quality mode on pen-up commit instead - slightly slower, much cleaner.
      */
     private fun commitUpdateModeFor(style: HardwarePenStyle): UpdateMode = when (style) {
-        HardwarePenStyle.PENCIL, HardwarePenStyle.DASH -> UpdateMode.HAND_WRITING_REPAINT_MODE
+        // Pencil used to belong in the fast/binary group - back when it drew a plain polyline. It
+        // is now stamped from the graphite mask with real grey levels, and settling those needs the
+        // fuller mode: a low-grey refresh flattens the grain into solid tone, which looks exactly
+        // like the texture never being applied at all.
+        HardwarePenStyle.DASH -> UpdateMode.HAND_WRITING_REPAINT_MODE
         else -> UpdateMode.GC
     }
 
