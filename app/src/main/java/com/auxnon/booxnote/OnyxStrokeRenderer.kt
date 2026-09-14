@@ -66,9 +66,6 @@ object OnyxStrokeRenderer {
     private const val PENCIL_TILT_MIN = 40f
     private const val PENCIL_TILT_MAX = 70f
 
-    /** How far leaning the pen spreads the mark along the lean. Confirmed working at a deliberately
-     *  absurd 12; settled here - stronger than the 3.2 that read as no response, without the smear. */
-    private const val PENCIL_ALTITUDE_GAIN = 8.5f
 
     /** Stamp length at full upright, as a fraction of the brush radius. Has to stay near 1: at 0.25
      *  an upright pen drew a thin sliver regardless of how wide the brush was set, which is the
@@ -76,10 +73,15 @@ object OnyxStrokeRenderer {
      *  setting. Keeping it close to `across` means upright reads as a full-width round point. */
     private const val PENCIL_UPRIGHT_LENGTH = 0.9f
 
-    /** How much of the lean's growth also applies across it. Zero: the stamp extends along the
-     *  lean only, so leaning produces a true oval rather than a larger circle. Any growth here
-     *  makes the perpendicular axis chase the long one and the shape rounds off again. */
-    private const val PENCIL_ACROSS_RATIO = 0f
+
+    /** Tilt range is split into this many pre-built nib shapes - a quarter of the range each. */
+    private const val PENCIL_TILT_BUCKETS = 5
+
+    /** Length:width of the most-leaned nib. */
+    private const val PENCIL_NIB_MAX_ASPECT = 6f
+
+    /** Short-axis resolution of each pre-built nib. */
+    private const val PENCIL_NIB_RESOLUTION = 128
 
     /** How much a fully leaned texture-stamped stroke (pencil, charcoal) lightens. */
     private const val LEAN_FADE = 0.45f
@@ -282,27 +284,40 @@ object OnyxStrokeRenderer {
         }
     }
 
-    /**
-     * The device's own tilt parameters for a stroke style: (enabled, scale), or null if it reports
-     * none. Read once per style and cached - it is a fixed property of the hardware.
-     */
-    private val tiltParamCache = HashMap<Int, Pair<Boolean, Float>?>()
-
-    private fun deviceTiltParameters(strokeStyle: Int): Pair<Boolean, Float>? =
-        tiltParamCache.getOrPut(strokeStyle) {
-            val params = runCatching {
-                com.onyx.android.sdk.device.Device.currentDevice().getStrokeParameters(strokeStyle)
-            }.getOrNull()
-            if (params == null || params.size < 2) {
-                null
-            } else {
-                Pair(params[0] != 0f, params[1]).also {
-                    android.util.Log.i("PencilNative", "device tilt params for style $strokeStyle: $it")
-                }
-            }
-        }
-
     private var pencilMask: Bitmap? = null
+
+    /**
+     * Pre-built oval nibs, one per quarter of the tilt range, cached by bucket.
+     *
+     * Stretching the round graphite mask to an 8:1 oval stretches its grain with it, so a leaned
+     * pencil laid down visibly smeared texture rather than a longer mark of the same texture. Each
+     * bucket instead gets its own stamp, drawn once: the mask is painted into an oval-clipped
+     * bitmap at *uniform* scale and tiled along the long axis, so the nib elongates while the grain
+     * stays the size it should be. Upright is round, fully leaned is a long oval.
+     */
+    private val pencilNibs = arrayOfNulls<Bitmap>(PENCIL_TILT_BUCKETS)
+
+    private fun pencilNib(bucket: Int): Bitmap? {
+        pencilNibs[bucket]?.let { if (!it.isRecycled) return it }
+        val mask = pencilMask() ?: return null
+        // Bucket 0 is round; each step lengthens the nib without widening it.
+        val aspect = 1f + bucket * (PENCIL_NIB_MAX_ASPECT - 1f) / (PENCIL_TILT_BUCKETS - 1)
+        val h = PENCIL_NIB_RESOLUTION
+        val w = (h * aspect).toInt().coerceAtLeast(h)
+        val nib = runCatching { Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) }.getOrNull() ?: return null
+        val c = Canvas(nib)
+        val clip = Path().apply { addOval(RectF(0f, 0f, w.toFloat(), h.toFloat()), Path.Direction.CW) }
+        c.clipPath(clip)
+        // Tile at uniform scale so grain density is identical in every bucket.
+        val p = Paint().apply { isFilterBitmap = true; isAntiAlias = true }
+        var x = 0
+        while (x < w) {
+            c.drawBitmap(mask, null, RectF(x.toFloat(), 0f, (x + h).toFloat(), h.toFloat()), p)
+            x += h
+        }
+        pencilNibs[bucket] = nib
+        return nib
+    }
 
     private fun pencilMask(): Bitmap? {
         pencilMask?.let { if (!it.isRecycled) return it }
@@ -334,7 +349,6 @@ object OnyxStrokeRenderer {
             isFilterBitmap = true
             colorFilter = PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN)
         }
-        val src = Rect(0, 0, mask.width, mask.height)
         val dst = RectF()
         val baseRadius = max(0.6f, widthPx * 0.5f)
         var carry = 0f
@@ -384,9 +398,9 @@ object OnyxStrokeRenderer {
                 // tilts; shrinking `across` was working against that and made lean look like a
                 // change of shape rather than of contact area.
                 val sizeScale = 0.85f + press * 0.3f
-                val along = baseRadius * sizeScale * (PENCIL_UPRIGHT_LENGTH + altitude * PENCIL_ALTITUDE_GAIN)
-                val across = baseRadius * sizeScale *
-                    (PENCIL_UPRIGHT_LENGTH + altitude * PENCIL_ALTITUDE_GAIN * PENCIL_ACROSS_RATIO)
+                // Width of the mark across the lean. Elongation is the nib's job now, so this
+                // stays near the brush width at every tilt and the stroke keeps the weight you set.
+                val across = baseRadius * sizeScale * PENCIL_UPRIGHT_LENGTH
                 // The same graphite spread over a larger contact patch has to lay down lighter -
                 // that fade is most of what makes a leaned pencil read as shading rather than as a
                 // fat dark line.
@@ -399,11 +413,19 @@ object OnyxStrokeRenderer {
                 grainSeed = grainSeed * 1664525 + 1013904223
                 val jitter = (((grainSeed ushr 8) and 0xFF) / 255f - 0.5f) * 18f
 
+                val bucket = (altitude * (PENCIL_TILT_BUCKETS - 1))
+                    .roundToInt().coerceIn(0, PENCIL_TILT_BUCKETS - 1)
+                val nib = pencilNib(bucket) ?: mask
+                // Size from the short axis only - the nib carries its own elongation, so scaling
+                // the long axis here as well would stretch an already-stretched shape.
+                val nibAspect = nib.width.toFloat() / nib.height.toFloat()
+                val halfShort = across
+                val halfLong = across * nibAspect
                 canvas.save()
                 canvas.translate(x, y)
                 canvas.rotate(Math.toDegrees(azimuth.toDouble()).toFloat() + jitter)
-                dst.set(-along, -across, along, across)
-                canvas.drawBitmap(mask, src, dst, paint)
+                dst.set(-halfLong, -halfShort, halfLong, halfShort)
+                canvas.drawBitmap(nib, null, dst, paint)
                 canvas.restore()
 
                 // Advance by the stamp's own size, not the brush radius. Fixed spacing meant a
@@ -531,19 +553,19 @@ object OnyxStrokeRenderer {
         val safeMaxPressure = max(1f, maxPressure)
         val screenMatrix = Matrix()
         val baseConfig = runCatching { NeoPencilPen.Companion.defaultPenConfig() }.getOrNull() ?: NeoPenConfig()
-        // Tilt settings come from the device, not from us. Onyx's own demo builds its charcoal
-        // TiltConfig from Device.currentDevice().getStrokeParameters(strokeStyle) - [0] is whether
-        // tilt applies to that brush, [1] the scale it should use - so the firmware ships the
-        // correct per-brush values and there is no need to guess them. Every value tried here by
-        // hand (TILT_SCALE_VALUE, then nothing at all) was a guess at exactly this.
-        val tilt = deviceTiltParameters(HardwarePenStyle.PENCIL.hardwareStrokeStyle)
+        // Tilt is enabled outright rather than read back from the device.
+        // Device.currentDevice().getStrokeParameters() looks like the authoritative source - it is
+        // what Onyx's own demo builds its TiltConfig from - but calling it breaks raw drawing on
+        // this hardware: after that query the chip still reports configured and enabled, stylus
+        // MotionEvents still arrive, and RawInputCallback never fires again. Bisecting pinned it to
+        // exactly that commit. It also returns empty arrays for every brush here, so there was
+        // nothing to gain from it in the first place.
         val penConfig = baseConfig
             .setColor(color)
             .setWidth(widthPx)
-            .setTiltEnabled(tilt?.first ?: true)
+            .setTiltEnabled(true)
             .setRotateAngle(0)
             .setMaxTouchPressure(safeMaxPressure)
-        tilt?.second?.let { penConfig.tiltScale = it }
         // pressureSensitivity and minWidth are deliberately left as defaultPenConfig() set them
         // (0.3 and 1.0). Forcing sensitivity to 1.0 - copied from the charcoal path, which builds a
         // bare config - makes stamp size track raw pressure almost entirely, so a normal press
