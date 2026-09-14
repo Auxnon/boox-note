@@ -1905,17 +1905,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateRawSuppression() {
-        // Floating panels deliberately aren't in this list: switching the pen off entirely is what
-        // made "start drawing and the modal gets out of the way" unreliable (see
-        // setRawExclusionRects). They carve themselves out of the pen's active area instead, below.
-        // The overview stays a hard suppression - it replaces the canvas, so there's nothing to
-        // draw on and nothing to carve out.
+        // Open panels suppress the pen outright - they are modal. Carving them out of the pen's
+        // area instead let drawing continue underneath, which kept the raw session open and with it
+        // the SDK's screen-refresh lock, so the area a dismissed panel vacated could never be
+        // repainted. Suppressing closes the session, releasing that lock while the panel is up.
         val suppress = activityPaused ||
             pickerInFlight ||
             aboutDialogVisible ||
             eraserUiTransitionInFlight ||
             uiTouchDepth > 0 ||
-            canvasOverviewPanel.visibility == View.VISIBLE
+            canvasOverviewPanel.visibility == View.VISIBLE ||
+            anyDismissablePanelVisible()
         penView.setRawInputSuppressed(suppress)
         // Deferred a frame: a panel that just became visible hasn't been positioned or measured
         // yet, so its bounds aren't readable until layout has run. setRawExclusionRects() ignores
@@ -2103,8 +2103,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (vacated.isEmpty) return false
+        // Order matters: repaint first, while the panel's suppression still has the raw session
+        // closed and the screen unlocked, and only then hand the pen back. Re-enabling first would
+        // reopen the session and re-lock the screen before the repaint could land.
+        refreshUiAfterOverlayDismiss(vacated)
         updateRawSuppression()
-        refreshUiAfterOverlayDismiss(vacated, deferToStrokeEnd = fromStylus)
         return true
     }
 

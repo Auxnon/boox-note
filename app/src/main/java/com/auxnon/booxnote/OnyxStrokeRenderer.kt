@@ -68,7 +68,7 @@ object OnyxStrokeRenderer {
 
     /** How far leaning the pen spreads the mark along the lean. Confirmed working at a deliberately
      *  absurd 12; settled here - stronger than the 3.2 that read as no response, without the smear. */
-    private const val PENCIL_ALTITUDE_GAIN = 6.5f
+    private const val PENCIL_ALTITUDE_GAIN = 8.5f
 
     /** Stamp length at full upright, as a fraction of the brush radius. Has to stay near 1: at 0.25
      *  an upright pen drew a thin sliver regardless of how wide the brush was set, which is the
@@ -76,11 +76,10 @@ object OnyxStrokeRenderer {
      *  setting. Keeping it close to `across` means upright reads as a full-width round point. */
     private const val PENCIL_UPRIGHT_LENGTH = 0.9f
 
-    /** How much of the lean's growth also applies across it. Kept low so the stamp becomes a
-     *  genuinely eccentric oval: let this rise and the perpendicular axis chases the long one and
-     *  the mark just inflates into a bigger circle. It still grows a little, so a leaned pencil
-     *  covers more paper rather than only changing shape. */
-    private const val PENCIL_ACROSS_RATIO = 0.12f
+    /** How much of the lean's growth also applies across it. Zero: the stamp extends along the
+     *  lean only, so leaning produces a true oval rather than a larger circle. Any growth here
+     *  makes the perpendicular axis chase the long one and the shape rounds off again. */
+    private const val PENCIL_ACROSS_RATIO = 0f
 
     /** How much a fully leaned texture-stamped stroke (pencil, charcoal) lightens. */
     private const val LEAN_FADE = 0.45f

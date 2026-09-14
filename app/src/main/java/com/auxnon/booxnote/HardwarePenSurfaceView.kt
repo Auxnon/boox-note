@@ -314,10 +314,20 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
             invalidateAndRefreshEpd(UpdateMode.GC)
             return
         }
-        runOnHelperThread { runCatching { helper.setRawDrawingEnabled(false) } }
-        postDelayed({
-            invalidate()
-            runCatching {
+        // closeRawDrawing(), not setRawDrawingEnabled(false). Per Onyx's own Pen SDK doc the screen
+        // refresh is *locked* for as long as raw drawing mode is open, and only closeRawDrawing()
+        // releases it - setRawDrawingEnabled(false) merely pauses scribbling and leaves the lock in
+        // place. That lock is why every repaint aimed at a dismissed panel was accepted and then
+        // did nothing: refreshScreenRegion, handwritingRepaint and region invalidate alike were all
+        // being issued into a locked screen.
+        // All three steps run in order on the helper thread. Previously the close was queued here
+        // while the repaint fired from a UI-thread postDelayed, so the repaint could - and given
+        // the symptom, evidently did - execute before the unlock landed, straight back into the
+        // locked screen it was meant to escape.
+        invalidate()
+        runOnHelperThread {
+            val closed = runCatching { helper.closeRawDrawing() }.isSuccess
+            val refreshed = runCatching {
                 EpdController.invalidate(this, UpdateMode.GC)
                 if (regionInView != null) {
                     EpdController.refreshScreenRegion(
@@ -327,15 +337,10 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
                 } else {
                     EpdController.refreshScreen(this, UpdateMode.GC)
                 }
-            }
-            postDelayed({
-                runOnHelperThread {
-                    runCatching {
-                        helper.setRawDrawingEnabled(!(rawInputSuppressed || viewportGestureSuppressRaw))
-                    }
-                }
-            }, RAW_SESSION_TOGGLE_SETTLE_MS)
-        }, RAW_SESSION_TOGGLE_SETTLE_MS)
+            }.isSuccess
+            Log.i(TAG, "overlay repaint: closedRawDrawing=$closed refreshed=$refreshed region=$regionInView")
+            post { reconfigureTouchHelperNow() }
+        }
     }
 
     /**
@@ -494,17 +499,18 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
     fun setRawInputSuppressed(suppressed: Boolean) {
         rawInputSuppressed = suppressed
         if (suppressed && strokeInProgress) {
-            // Disabling raw drawing mid-stroke means onEndRawDrawing never arrives, so the flag
-            // would stay set forever and performReconfigureTouchHelper() would defer every
-            // reconfigure from then on. Commit what was drawn before letting go of it - simply
-            // clearing the flag threw the stroke away, because onEndRawDrawing returns early
-            // without it and nothing else ever rasterises the points.
             abandonStrokeKeepingInk("raw input suppressed")
-            reconfigureTouchHelper()
         }
         val helper = touchHelper ?: return
-        runOnHelperThread {
-            runCatching { helper.setRawDrawingEnabled(!(suppressed || viewportGestureSuppressRaw)) }
+        if (suppressed) {
+            // closeRawDrawing(), not setRawDrawingEnabled(false): only closing releases the
+            // screen-refresh lock the SDK holds for as long as raw drawing mode is open. Pausing
+            // leaves it held, which is why a panel dismissed while the session was merely paused
+            // could never repaint the area it vacated.
+            runOnHelperThread { runCatching { helper.closeRawDrawing() } }
+        } else {
+            // Reopening resets the chip, so everything has to be reapplied - that is a reconfigure.
+            reconfigureTouchHelperNow()
         }
     }
 
@@ -814,7 +820,15 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         dispatchStylusHoverButtonState(event, "touch")
         if (rawInputSuppressed) {
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> Log.w(TAG, "onTouchEvent DOWN dropped: rawInputSuppressed=true")
+                MotionEvent.ACTION_DOWN -> {
+                    Log.w(TAG, "onTouchEvent DOWN dropped: rawInputSuppressed=true")
+                    // Deliberately does not draw: while a panel is open the pen only dismisses it,
+                    // and the next stroke draws normally. The raw session is closed here, so this
+                    // plain MotionEvent is the only signal the pen was used at all.
+                    if (eventHasStylus(event)) {
+                        stylusPointerListener?.invoke(event.rawX, event.rawY)
+                    }
+                }
                 // Terminal events still have to release viewport-gesture state, which lives below
                 // this early return in handleViewportGesture(). Suppression can switch on *during*
                 // a gesture - pinching past the zoom-out limit opens the canvas overview, which
