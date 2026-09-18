@@ -75,7 +75,7 @@ object OnyxStrokeRenderer {
 
 
     /** Tilt range is split into this many pre-built nib shapes - a quarter of the range each. */
-    private const val PENCIL_TILT_BUCKETS = 5
+    private const val PENCIL_TILT_BUCKETS = 8
 
     /** Length:width of the most-leaned nib. */
     private const val PENCIL_NIB_MAX_ASPECT = 6f
@@ -346,7 +346,10 @@ object OnyxStrokeRenderer {
         val safeMaxPressure = max(1f, maxPressure)
         val paint = Paint().apply {
             isAntiAlias = true
-            isFilterBitmap = true
+            // No bitmap filtering: nibs are built at 128px short-axis and usually drawn smaller, and
+            // smoothing on the way down averages neighbouring grain together - which is the texture
+            // dissolving back into the flat tone it was built to avoid.
+            isFilterBitmap = false
             colorFilter = PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN)
         }
         val dst = RectF()
