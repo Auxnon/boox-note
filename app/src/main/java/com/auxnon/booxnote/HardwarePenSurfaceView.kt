@@ -981,6 +981,11 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         //    (5): no flicker, but RawInputCallback never fired at all - confirmed via logcat
         //    (touchHelper present, onTouchEvent claims success, but zero onBeginRawDrawing/
         //    render: ever, exported PNGs blank). Ruled out FEATURE_APP_TOUCH_RENDER as relevant.
+        //  - FEATURE_APP_TOUCH_RENDER (1) ALONE: tried so the app could draw the live stroke with
+        //    the same renderer as the bake, making preview and bake identical. No raw callbacks at
+        //    all - nothing baked - while the chip carried on drawing its own preview regardless.
+        //    That exhausts every app-render flag (1, 4, 5 silent; 3 freezes the OS), so on this
+        //    hardware the chip MUST draw the preview and it can never be our renderer.
         //  - FEATURE_SF_TOUCH_RENDER (2) ALONE: the fix. No flicker/freeze, no OS lockup, and
         //    RawInputCallback fires correctly - strokes render and persist. Whatever FEATURE_ALL_
         //    TOUCH_RENDER's freeze issue actually was, it needed FEATURE_APP_TOUCH_RENDER(1)
