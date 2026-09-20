@@ -121,7 +121,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var canvasOverviewAdapter: CanvasOverviewAdapter
     private lateinit var buttonNewCanvas: ImageButton
     private var currentCanvasId: String = ""
-    private lateinit var livePreviewBtn: TextView
     private var overlayRefreshOwed = false
     private val pendingOverlayDirty = Rect()
     private var overlayRefreshFallback: Runnable? = null
@@ -276,7 +275,6 @@ class MainActivity : AppCompatActivity() {
         val shareBtn = findViewById<View>(R.id.buttonShare)
         val resetViewBtn = findViewById<View>(R.id.buttonResetView)
         val aboutBtn = findViewById<View>(R.id.buttonAbout)
-        livePreviewBtn = findViewById(R.id.buttonToggleLivePreview)
 
         setupToolbarPill()
         setupToolSlots()
@@ -353,9 +351,6 @@ class MainActivity : AppCompatActivity() {
             resetViewport()
             updateRawSuppression()
         }
-        livePreviewBtn.setOnClickListener { setLivePreview(!penView.isTexturedPencilPreview()) }
-        guardRawMode(livePreviewBtn)
-        setLivePreview(prefs().getBoolean(KEY_LIVE_PREVIEW, false))
         aboutBtn.setOnClickListener {
             fileMenuPanel.visibility = View.GONE
             showAboutDialog()
@@ -2040,24 +2035,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         return super.dispatchKeyEvent(event)
-    }
-
-    /**
-     * Switches between the pen chip drawing the live stroke and us drawing it.
-     *
-     * Drawing the preview ourselves turned out to be impossible - the only feature flag that
-     * delivers pen input on this device is the one where the chip draws - so the lever we have is
-     * which brush it previews with, and the chip's textured brush is charcoal.
-     *
-     * When on, the pencil tool uses the charcoal engine for BOTH the preview and the bake. That is
-     * the whole point: one engine drawing both halves means what appears under the pen is what
-     * stays there, instead of a textured preview being replaced by a differently-textured bake.
-     * The cost is that the tool is charcoal-flavoured rather than literally a pencil.
-     */
-    private fun setLivePreview(enabled: Boolean) {
-        penView.setTexturedPencilPreview(enabled)
-        livePreviewBtn.text = if (enabled) "Pencil: textured" else "Pencil: plain"
-        prefs().edit().putBoolean(KEY_LIVE_PREVIEW, enabled).apply()
     }
 
     private fun anyDismissablePanelVisible(): Boolean =

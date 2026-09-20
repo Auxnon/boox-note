@@ -338,27 +338,6 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
         }, RAW_SESSION_TOGGLE_SETTLE_MS)
     }
 
-    /**
-     * Previews the pencil using the chip's charcoal brush instead of its pencil one.
-     *
-     * A genuine app-drawn preview turned out to be unreachable: the only TouchHelper feature flag
-     * that delivers pen input at all on this device is the one where SurfaceFlinger draws the
-     * stroke, and setRawDrawingRenderEnabled(false) does not stop it (this project ran that way for
-     * a long time and still had a preview). So the chip will draw - the only choice is which brush
-     * it draws with, and that need not be the brush we bake with. Charcoal is the one whose
-     * hardware preview has real texture, which is far closer to the grainy pencil bake than the
-     * chip's own flat pencil dabs.
-     */
-    fun setTexturedPencilPreview(enabled: Boolean) {
-        if (texturedPencilPreview == enabled) return
-        texturedPencilPreview = enabled
-        reconfigureTouchHelper()
-    }
-
-    fun isTexturedPencilPreview(): Boolean = texturedPencilPreview
-
-    @Volatile
-    private var texturedPencilPreview = false
 
     fun canUndo(): Boolean = undoStack.isNotEmpty()
 
@@ -969,16 +948,22 @@ class HardwarePenSurfaceView @JvmOverloads constructor(
      * mismatch rather than fixing it - the point of the swap is that one engine draws both halves,
      * so what appears under the pen is what stays there.
      */
-    private fun bakeStyleFor(style: HardwarePenStyle): HardwarePenStyle =
-        if (texturedPencilPreview && style == HardwarePenStyle.PENCIL) {
-            HardwarePenStyle.CHARCOAL
-        } else {
-            style
-        }
+    /**
+     * The pencil now bakes as a pencil in both modes.
+     *
+     * This used to swap it to charcoal when the textured toggle was on, so preview and bake would
+     * at least be one engine. That predates having real lean textures, and it meant the toggle
+     * bypassed them entirely - the pencil drew charcoal, with charcoal's sizing, which reads as the
+     * authored textures being ignored. The toggle now only changes what the chip previews with.
+     */
+    private fun bakeStyleFor(style: HardwarePenStyle): HardwarePenStyle = style
 
     /** Which brush the chip previews with - not necessarily the one we bake with. */
     private fun previewStrokeStyleFor(style: HardwarePenStyle): Int =
-        if (texturedPencilPreview && style == HardwarePenStyle.PENCIL) {
+        if (style == HardwarePenStyle.PENCIL) {
+            // Always the textured preview now. The chip's own pencil is flat dabs that look nothing
+            // like the bake; charcoal is its one brush with real grain, so it is the closer match
+            // and there is no reason to offer the worse one as a choice.
             HardwarePenStyle.CHARCOAL.hardwareStrokeStyle
         } else {
             style.hardwareStrokeStyle
